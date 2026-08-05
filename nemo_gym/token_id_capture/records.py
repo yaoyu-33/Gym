@@ -150,6 +150,13 @@ class TokenEntry(BaseModel):
     # Identify the continuation fingerprint algorithm.
     fingerprint_version: int | None = None
 
+    # --- Added with prefix supply (schema version 4).
+    # Whether the model server handed the engine this call's prefix verbatim rather than letting
+    # the chat template re-render it. Recorded per call so a run can be audited afterwards:
+    # supply fires only on a unique parent whose conversation still matches, so supplied over
+    # total is the honest measure of how often it applied rather than falling back.
+    prefix_supplied: bool = False
+
     @model_validator(mode="after")
     def _refuse_a_newer_record(self) -> "TokenEntry":
         """Accept older records and reject newer records.

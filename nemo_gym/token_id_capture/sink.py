@@ -68,6 +68,8 @@ class CaptureContext:
     model: str = ""
     # ``commit_entry`` sets this after another capture path records the call.
     committed: bool = False
+    # Record whether the model server supplied this call's prefix.
+    prefix_supplied: bool = False
     # Resolve the parent once before dispatch.
     # Downstream inference and capture share this immutable decision.
     parent_resolution: LineageResolution | None = None
@@ -232,6 +234,7 @@ async def capture_tokens(
             # so the recorded id matches what the client received in every dialect.
             response_id=str(payload.get("id") or "") or None,
             created_at=time.time(),
+            prefix_supplied=sink.prefix_supplied,
         )
         if request_messages is not None:
             stamp_continuation(entry, list(request_messages))
