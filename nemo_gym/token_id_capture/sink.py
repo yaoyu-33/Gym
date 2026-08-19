@@ -236,7 +236,7 @@ async def capture_tokens(
             # so the recorded id matches what the client received in every dialect.
             response_id=str(payload.get("id") or "") or None,
             created_at=time.time(),
-            prefix_supplied=sink.prefix_supplied,
+            prefix_supplied=context.prefix_supplied,
         )
         if request_messages is not None:
             stamp_continuation(entry, list(request_messages))
