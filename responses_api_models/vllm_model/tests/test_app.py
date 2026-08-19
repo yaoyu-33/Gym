@@ -5502,6 +5502,7 @@ class TestPrefixSupplyReachesTokenize:
                     {
                         "index": 0,
                         "finish_reason": "stop",
+                        "token_ids": [77],
                         "message": {"role": "assistant", "content": "ok"},
                         "logprobs": {
                             "content": [{"token": "token_id:77", "logprob": -0.5, "bytes": None, "top_logprobs": []}]
@@ -5562,6 +5563,7 @@ class TestPrefixSupplyReachesTokenize:
                     {
                         "index": 0,
                         "finish_reason": "stop",
+                        "token_ids": [77],
                         "message": {"role": "assistant", "content": "ok"},
                         "logprobs": {
                             "content": [{"token": "token_id:77", "logprob": -0.5, "bytes": None, "top_logprobs": []}]
