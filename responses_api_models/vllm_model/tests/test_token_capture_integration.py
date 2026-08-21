@@ -187,12 +187,13 @@ def _simulate_two_workers(
             response = client.post("/v1/chat/completions", json={"messages": messages})
         finally:
             reset_token_sink(token)
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         return response.json(), context
 
     first_request = [{"role": "user", "content": "first question"}]
     first_response, first_context = serve(worker_a, "call-a", first_request)
-    first_answer = first_response["choices"][0]["message"]
+    first_message = first_response["choices"][0]["message"]
+    first_answer = {"role": first_message["role"], "content": first_message["content"]}
 
     second_request = first_request + [first_answer, {"role": "user", "content": "second question"}]
     _, second_context = serve(worker_b, "call-b", second_request)
