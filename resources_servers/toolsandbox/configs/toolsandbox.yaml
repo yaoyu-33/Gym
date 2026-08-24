@@ -42,6 +42,20 @@ toolsandbox:
       preferred_tool_backend: default
       test_mode: false
 
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/toolsandbox/data/example.jsonl
+        # Apple/ToolSandbox scenarios are CC-BY-NC 4.0, which is not in
+        # nemo_gym's allowed license enum; TBD until the correct value exists.
+        license: TBD
+      # Full scenario set: one row per scenario index. Regenerate with
+      #   python resources_servers/toolsandbox/prepare_toolsandbox.py
+      - name: test
+        type: validation
+        jsonl_fpath: resources_servers/toolsandbox/data/test_toolsandbox.jsonl
+        # See note above: CC-BY-NC 4.0 upstream, marked TBD pending an enum value.
+        license: TBD
 toolsandbox_agent:
   responses_api_agents:
     toolsandbox_agent:
@@ -57,17 +71,3 @@ toolsandbox_agent:
       # transition snapshots. response.output is consumed as a flat list;
       # transitions (list-of-lists) break downstream text extraction.
       return_transitions: false
-      datasets:
-      - name: example
-        type: example
-        jsonl_fpath: resources_servers/toolsandbox/data/example.jsonl
-        # Apple/ToolSandbox scenarios are CC-BY-NC 4.0, which is not in
-        # nemo_gym's allowed license enum; TBD until the correct value exists.
-        license: TBD
-      # Full scenario set: one row per scenario index. Regenerate with
-      #   python resources_servers/toolsandbox/prepare_toolsandbox.py
-      - name: test
-        type: validation
-        jsonl_fpath: resources_servers/toolsandbox/data/test_toolsandbox.jsonl
-        # See note above: CC-BY-NC 4.0 upstream, marked TBD pending an enum value.
-        license: TBD

@@ -47,6 +47,10 @@ finance_sec_search_resources_server:
       retrieval_model_context_length: 131072
 
 # Judge model server (OpenAI or local — configured via env.yaml)
+      datasets:
+      - name: example
+        type: example
+        jsonl_fpath: resources_servers/finance_sec_search/data/example.jsonl
 search_judge_model:
   responses_api_models:
     openai_model:
@@ -64,7 +68,7 @@ finance_agent:
       # Loop policy mirroring vals-ai/finance-agent: bounded by turns rather than
       # wall clock, and every tool error is handed back to the model.
       no_tool_call_nudge: Continue.
-      max_time_seconds: null
+      max_time_seconds:
       abort_on_tool_error_types: []
       max_steps: 50
       truncate_on_overflow: false
@@ -75,7 +79,3 @@ finance_agent:
       model_server:
         type: responses_api_models
         name: policy_model
-      datasets:
-      - name: example
-        type: example
-        jsonl_fpath: resources_servers/finance_sec_search/data/example.jsonl
