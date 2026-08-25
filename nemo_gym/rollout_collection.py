@@ -149,9 +149,12 @@ class _RolloutProgressWriter:
         self._fpath = fpath
         self._min_interval_seconds = min_interval_seconds
         self._last_write_time: Optional[float] = None
+        self._latest_completed = 0
         self._disabled = False
+        self._closed = False
 
     def update(self, completed: int, *, force: bool = False) -> None:
+        self._latest_completed = completed
         if self._disabled:
             return
 
@@ -189,6 +192,12 @@ class _RolloutProgressWriter:
                     tmp_fpath.unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.update(self._latest_completed, force=True)
 
 
 def _nonnegative_int(value: Any) -> Optional[int]:
@@ -464,7 +473,7 @@ class SharedRolloutCollectionConfig(UploadRolloutsConfigMixin, BaseNeMoGymCLICon
     progress_file_fpath: Optional[str] = Field(
         default=None,
         description=(
-            "Path for the machine-readable rollout progress counter. "
+            "Path for the built-in collector's machine-readable completed-attempt counter. "
             "Defaults to '<output_jsonl_fpath stem>_progress' alongside output_jsonl_fpath. "
             "An explicitly configured path must have a single writer."
         ),
@@ -508,8 +517,9 @@ class SharedRolloutCollectionConfig(UploadRolloutsConfigMixin, BaseNeMoGymCLICon
         description=(
             "Optional dotted ``module.path:function`` to run rollout collection instead of the "
             "built-in helper. Lets a benchmark plug in a custom procedure (e.g. an adaptive, "
-            "multi-pass run) while still producing the standard rollout + aggregate-metrics "
-            "artifacts. The function is awaited with (rollout_collection_config, global_config_dict). "
+            "multi-pass run) while still producing the standard rollout, progress, and "
+            "aggregate-metrics artifacts. The custom driver owns publishing those artifacts. "
+            "The function is awaited with (rollout_collection_config, global_config_dict). "
             "When unset, the standard single-pass collection runs."
         ),
     )
@@ -1005,6 +1015,18 @@ class RolloutCollectionHelper(BaseModel):
         return input_rows, rows, results, result_strs
 
     async def run_from_config(self, config: RolloutCollectionConfig) -> Tuple[List[Dict]]:
+        progress_writer = _RolloutProgressWriter(
+            config.resolved_progress_file_fpath,
+            min_interval_seconds=_PROGRESS_UPDATE_INTERVAL_SECONDS,
+        )
+        try:
+            return await self._run_from_config(config, progress_writer)
+        finally:
+            progress_writer.close()
+
+    async def _run_from_config(
+        self, config: RolloutCollectionConfig, progress_writer: _RolloutProgressWriter
+    ) -> Tuple[List[Dict]]:
         output_fpath = Path(config.output_jsonl_fpath)
         failures_fpath = failures_path_for(output_fpath)
 
@@ -1060,10 +1082,6 @@ class RolloutCollectionHelper(BaseModel):
             output_fpath.unlink(missing_ok=True)
             failures_fpath.unlink(missing_ok=True)
 
-        progress_writer = _RolloutProgressWriter(
-            config.resolved_progress_file_fpath,
-            min_interval_seconds=_PROGRESS_UPDATE_INTERVAL_SECONDS,
-        )
         progress_writer.update(len(results), force=True)
 
         semaphore = nullcontext()
@@ -1283,7 +1301,7 @@ class RolloutCollectionHelper(BaseModel):
 
         results_file.close()
         failures_file.close()
-        progress_writer.update(len(results), force=True)
+        progress_writer.close()
         if owned_token_source is not None:
             await owned_token_source.close()
 

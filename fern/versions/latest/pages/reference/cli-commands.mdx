@@ -612,6 +612,7 @@ Collate data, start the servers, and collect rollouts. This is the main evaluati
 | `--agent`, `-a` | Agent to collect rollouts with. |
 | `--input`, `-i` | Input tasks JSONL file. |
 | `--output`, `-o` | Output rollouts JSONL file. |
+| `--progress-file PATH` | Override the machine-readable completed-attempt counter path. By default, `rollouts.jsonl` produces `rollouts_progress` beside it. |
 | `--limit` | Maximum number of tasks to run. |
 | `--num-repeats` | Rollouts per task (for mean@k metrics). Pass an int to apply to every task, or a dict keyed by `agent_ref.name` for per-agent counts (e.g. `'{simple_agent: 32, swe_agent: 1}'`) when one input file mixes agents. In dict form, the special key `_default` is the fallback for agents not explicitly listed; without it, any unlisted row's agent raises a single consolidated error. |
 | `--prompt-config` | Prompt template YAML to apply. |
@@ -685,6 +686,7 @@ How it works:
 
 - **Materialized inputs.** On the first run, the fully expanded input rows (after `--num-repeats`, `--limit`, `--prompt-config`, and any overrides) are written to a sidecar file next to your output. The path is derived from `--output` by appending `_materialized_inputs` to the stem — so `rollouts.jsonl` produces `rollouts_materialized_inputs.jsonl`.
 - **Incremental output.** Successful rollouts are flushed to the main output JSONL after each completion; retriable failures go to a `<stem>_failures.jsonl` sidecar, so partial progress survives a crash.
+- **Progress counter.** The built-in collector atomically publishes a plain integer to `<output stem>_progress`, or to `--progress-file` when configured. It starts from successful rollouts banked in the main JSONL when resuming, then counts every collector attempt completed during the current process, including attempts routed to the failures sidecar or marked no-persist. It is progress telemetry, not the number of rows in the main JSONL. Custom rollout-collection drivers own publishing this standard artifact.
 - **Matching.** On resume, completed work is matched by `(task_index, rollout_index)` against the materialized inputs, and already-completed rows are skipped. The run prints a summary such as the number of original input rows, rows already done, and rows that still need to be run.
 - **Fallback.** If either the materialized inputs or the output file is missing, resume is skipped and the run starts fresh. Without `--resume`, existing output is cleared before the run.
 
