@@ -312,6 +312,9 @@ class RewardProfiler:
                 se = std / n**0.5
                 entry[f"mean_across_repeats/{col}"] = mean
                 entry[f"median_across_repeats/{col}"] = float(col_data.median())
+                entry[f"std_across_repeats/{col}"] = std
+                entry[f"min_across_repeats/{col}"] = float(col_data.min())
+                entry[f"max_across_repeats/{col}"] = float(col_data.max())
                 entry[f"se_across_repeats/{col}"] = se
                 if ci := self._confidence_interval(mean, se, n):
                     entry[f"ci_low_95_across_repeats/{col}"], entry[f"ci_high_95_across_repeats/{col}"] = ci
