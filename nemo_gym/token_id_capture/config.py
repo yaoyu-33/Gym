@@ -22,6 +22,14 @@ env:
       enabled: true
       dir: /tmp/ng_tokcap                  # The writer and consumer share this node-local directory.
       sink: my_pkg.sinks:MyDataPlaneSink   # This optional sink replaces the file store.
+
+my_agent:
+  responses_api_agents:
+    custom_agent:
+      token_id_capture: true
+      token_id_capture_non_generating_requests:
+        - method: GET
+          path: /custom/metadata
 ```
 
 Evaluation capture uses ``/ng-rollout/<id>/...``.
@@ -70,7 +78,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from nemo_gym.token_id_capture.protocols import (
     TokenSink,
@@ -81,6 +89,33 @@ from nemo_gym.token_id_capture.protocols import (
 logger = logging.getLogger(__name__)
 
 TOKEN_ID_CAPTURE_BLOCK = "token_id_capture"
+AGENT_NON_GENERATING_REQUESTS_KEY = "token_id_capture_non_generating_requests"
+
+
+class NonGeneratingRequest(BaseModel):
+    """Declare one exact model request that cannot return policy-generated content."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: str
+    path: str
+
+    @field_validator("method", mode="before")
+    @classmethod
+    def _normalize_method(cls, value: Any) -> str:
+        method = str(value).upper()
+        if not method or not method.isascii() or not method.isalpha():
+            raise ValueError("method must be an HTTP method without wildcards")
+        return method
+
+    @field_validator("path")
+    @classmethod
+    def _validate_path(cls, path: str) -> str:
+        if not path.startswith("/"):
+            raise ValueError("path must start with '/'")
+        if any(character in path for character in "?#*{}"):
+            raise ValueError("path must be exact and cannot contain query strings, fragments, or wildcards")
+        return path
 
 
 class TokenIdCaptureSettings(BaseModel):
@@ -221,3 +256,25 @@ def token_id_capture_enabled_for_agent(global_config_dict: Any, agent_name: str 
         for agent_config in agents.values()
         if isinstance(agent_config, Mapping)
     )
+
+
+def non_generating_requests_for_agents(global_config_dict: Any) -> frozenset[tuple[str, str]]:
+    """Resolve exact non-generating requests declared by configured agents."""
+    if not isinstance(global_config_dict, Mapping):
+        return frozenset()
+
+    requests: set[tuple[str, str]] = set()
+    for server_entry in global_config_dict.values():
+        if not isinstance(server_entry, Mapping):
+            continue
+        agents = server_entry.get("responses_api_agents")
+        if not isinstance(agents, Mapping):
+            continue
+        for agent_config in agents.values():
+            if not isinstance(agent_config, Mapping):
+                continue
+            declarations = agent_config.get(AGENT_NON_GENERATING_REQUESTS_KEY) or []
+            for declaration in declarations:
+                request = NonGeneratingRequest.model_validate(declaration)
+                requests.add((request.method, request.path))
+    return frozenset(requests)

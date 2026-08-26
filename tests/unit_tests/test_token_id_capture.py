@@ -38,6 +38,7 @@ from fastapi import Body, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig
 from nemo_gym.base_responses_api_model import (
     BaseResponsesAPIModelConfig,
     CaptureStore,
@@ -390,6 +391,40 @@ def test_config_keeps_settings_when_capture_is_off(tmp_path):
     assert cfg.build_sink() is None
 
 
+def test_agent_config_accepts_exact_non_generating_requests():
+    cfg = BaseResponsesAPIAgentConfig(
+        host="0.0.0.0",
+        port=8099,
+        entrypoint="app.py",
+        name="custom_agent",
+        token_id_capture_non_generating_requests=[{"method": "get", "path": "/custom/metadata"}],
+    )
+
+    assert [(request.method, request.path) for request in cfg.token_id_capture_non_generating_requests] == [
+        ("GET", "/custom/metadata")
+    ]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        {"method": "*", "path": "/v1/models"},
+        {"method": "GET", "path": "v1/models"},
+        {"method": "GET", "path": "/v1/*"},
+        {"method": "GET", "path": "/v1/models?all=true"},
+    ],
+)
+def test_agent_config_rejects_broad_non_generating_requests(declaration):
+    with pytest.raises(ValidationError):
+        BaseResponsesAPIAgentConfig(
+            host="0.0.0.0",
+            port=8099,
+            entrypoint="app.py",
+            name="custom_agent",
+            token_id_capture_non_generating_requests=[declaration],
+        )
+
+
 def test_mask_fraction_limit_defaults_off_and_parses():
     default = TokenIdCaptureConfig.model_validate(_block(dir="/tmp/token-capture"))
     configured = TokenIdCaptureConfig.model_validate(_block(dir="/tmp/token-capture", max_mask_fraction=0.5))
@@ -668,15 +703,19 @@ def test_successful_unknown_capture_path_fails_closed(tmp_path):
     assert TokenCaptureStore(tmp_path).freeze_now("unknown-roll0").incomplete is True
 
 
-def test_model_server_can_declare_successful_non_generating_route(tmp_path):
-    class MetadataModel(_CapturingModel):
-        non_generating_model_routes = frozenset({("POST", "/v1/custom-metadata")})
-
-    server = MetadataModel(
-        config=BaseResponsesAPIModelConfig(host="0.0.0.0", port=8099, entrypoint="", name="srv"),
-        server_client=MagicMock(spec=ServerClient, global_config_dict=_both_enabled(tmp_path)),
-    )
-    app = server.setup_webserver()
+def test_byo_agent_can_declare_successful_non_generating_route_in_config(tmp_path):
+    config = _both_enabled(tmp_path)
+    config["byo_agent"] = {
+        "responses_api_agents": {
+            "custom_agent": {
+                "token_id_capture": True,
+                "token_id_capture_non_generating_requests": [
+                    {"method": "POST", "path": "/v1/custom-metadata"},
+                ],
+            },
+        },
+    }
+    app = _server(config).setup_webserver()
 
     @app.post("/v1/custom-metadata")
     async def custom_metadata():
@@ -684,12 +723,12 @@ def test_model_server_can_declare_successful_non_generating_route(tmp_path):
 
     client = TestClient(app)
     response = client.post(
-        "/ng-rollout/declared-roll0/training-token-capture/v1/custom-metadata",
+        "/ng-rollout/byo-roll0/training-token-capture/v1/custom-metadata",
         json={},
     )
 
     assert response.status_code == 200
-    assert TokenCaptureStore(tmp_path).freeze_now("declared-roll0").incomplete is False
+    assert TokenCaptureStore(tmp_path).freeze_now("byo-roll0").incomplete is False
 
 
 def test_package_is_dependency_free_leaf():

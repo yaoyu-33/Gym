@@ -37,7 +37,7 @@ import time
 from abc import abstractmethod
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, ClassVar, Mapping, Optional
+from typing import Any, Mapping, Optional
 from uuid import uuid4
 
 import orjson
@@ -79,7 +79,7 @@ from nemo_gym.token_id_capture import (
 
 # The store factory needs Gym's server stack.
 # The leaf package does not re-export it.
-from nemo_gym.token_id_capture.config import token_id_capture_config
+from nemo_gym.token_id_capture.config import non_generating_requests_for_agents, token_id_capture_config
 from nemo_gym.token_id_capture.store import make_token_store
 
 
@@ -99,10 +99,6 @@ class BaseResponsesAPIModel(BaseServer):
 
 
 class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
-    # Subclasses can declare successful metadata or health routes here.
-    # Unknown successful routes fail closed during training-token capture.
-    non_generating_model_routes: ClassVar[frozenset[tuple[str, str]]] = frozenset()
-
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
 
@@ -113,7 +109,6 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
             capture_config,
             model_server_name=self.config.name,
             global_config_dict=self.server_client.global_config_dict,
-            non_generating_requests=self.non_generating_model_routes,
         )
 
         app.post("/v1/chat/completions")(self.chat_completions_dispatch)
@@ -1122,7 +1117,7 @@ class _CaptureMiddleware:
         # Installed sinks are resolved for each request.
         token_sink = self._configured_sink or installed_token_sink() or self._token_store
         capture_wanted = token_capture_requested and (token_sink is not None or self._token_capture_enabled)
-        if token_capture_requested and dialect is None and not known_non_generating and token_sink is not None:
+        if token_capture_requested and dialect is None and token_sink is not None:
             # Failed probes cannot return policy-generated content.
             # Successful unclassified routes may return content that enters a later prompt.
             # Mark them before the response start reaches the client.
@@ -1132,11 +1127,18 @@ class _CaptureMiddleware:
                 nonlocal marked_incomplete
                 if message.get("type") == "http.response.start":
                     status = int(message.get("status") or 0)
+                    logger.info(f"Observed auxiliary model request {method} {path} with HTTP status {status}.")
                     response_can_have_content = 200 <= status < 300 and status not in {204, 205}
-                    if response_can_have_content and not marked_incomplete:
+                    if not known_non_generating and response_can_have_content and not marked_incomplete:
                         marked_incomplete = True
                         try:
                             await token_sink.mark_incomplete(rollout_from_path, "")
+                            logger.warning(
+                                f"Marked rollout {rollout_from_path} incomplete because unclassified model request "
+                                f"{method} {path} returned HTTP {status}. Declare the exact request under "
+                                "the agent's token_id_capture_non_generating_requests only if its response cannot "
+                                "contain policy-generated content."
+                            )
                         except Exception:
                             logger.warning(
                                 "Could not mark rollout %s incomplete for unobserved path %s.",
@@ -1333,7 +1335,6 @@ def install_model_call_capture(
     *,
     model_server_name: str | None = None,
     global_config_dict: Any = None,
-    non_generating_requests: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     """Install model-call capture middleware.
 
@@ -1353,6 +1354,9 @@ def install_model_call_capture(
     # Spawned workers do not inherit a launcher-installed sink.
     configured_sink = (
         token_id_capture_config(global_config_dict).build_sink() if global_config_dict is not None else None
+    )
+    agent_non_generating_requests = (
+        non_generating_requests_for_agents(global_config_dict) if global_config_dict is not None else frozenset()
     )
     owned_sinks = [sink for sink in (configured_sink, token_store) if sink is not None]
 
@@ -1381,7 +1385,7 @@ def install_model_call_capture(
         token_capture_enabled=(
             token_id_capture_config(global_config_dict).enabled if global_config_dict is not None else False
         ),
-        non_generating_requests=non_generating_requests,
+        non_generating_requests=agent_non_generating_requests,
     )
 
 
