@@ -25,4 +25,3 @@ tau2_banking_knowledge_alltools_agent:
         prompt_config:
         prepare_script: benchmarks/tau2/prepare_utils/banking_alltools.py
         num_repeats: 8
-        agent: tau2_banking_knowledge_alltools_agent

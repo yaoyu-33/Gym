@@ -19,7 +19,6 @@ opencode_deepswe_resources_server:
         jsonl_fpath: benchmarks/deepswe/data/deepswe_benchmark.jsonl
         prepare_script: benchmarks/deepswe/prepare.py
         num_repeats: 5
-        agent: opencode_sandboxed_agent_deepswe
 opencode_sandboxed_agent_deepswe:
   _inherit_from: opencode_sandboxed_agent
   responses_api_agents:

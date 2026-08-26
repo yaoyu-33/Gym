@@ -28,4 +28,3 @@ tau2_banking_knowledge_bm25_grep_artificial_analysis_agent:
         prompt_config:
         prepare_script: benchmarks/tau2/prepare_utils/banking_bm25_grep.py
         num_repeats: 5
-        agent: tau2_banking_knowledge_bm25_grep_artificial_analysis_agent

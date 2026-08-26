@@ -25,4 +25,3 @@ tau2_banking_knowledge_terminal_use_agent:
         prompt_config:
         prepare_script: benchmarks/tau2/prepare_utils/banking_terminal_use.py
         num_repeats: 8
-        agent: tau2_banking_knowledge_terminal_use_agent
