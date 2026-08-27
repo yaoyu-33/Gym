@@ -93,7 +93,9 @@ def resolve_output_dir(config: ComparisonConfig) -> Path:
     the metrics file that was actually read rather than at a same-named path under the cwd.
     """
     if config.output_dirpath:
-        return _resolve_under_cwd_or_install(config.output_dirpath)
+        p = Path(config.output_dirpath)
+        return p if p.is_absolute() else Path.cwd() / p
+    # if we use the same location as the candidate rollouts, it should be save to write there and we can use _resolve_under_cwd_or_install function
     return _resolve_under_cwd_or_install(config.candidate_rollouts_jsonl_fpaths[-1]).parent
 
 
