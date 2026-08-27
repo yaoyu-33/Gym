@@ -19,7 +19,6 @@ never opened: it is the run's identity and the handle its `_aggregate_metrics.js
 derived from.
 """
 
-import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
@@ -27,6 +26,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 import orjson
 
 from nemo_gym import _resolve_under_cwd_or_install
+from nemo_gym.cli.utils import did_you_mean
 from nemo_gym.comparison.schema import RunFile
 from nemo_gym.config_types import ConfigError, ConfigPathNotFoundError
 from nemo_gym.global_config import (
@@ -145,12 +145,9 @@ def _sole_agent(run_file: RunFile) -> str:
 
 def _require_agent(run_file: RunFile, agent_name: str) -> None:
     if agent_name not in run_file.entries_by_agent:
-        # Same " Did you mean `X`?" shape the CLI uses for unknown component names, inlined so the
-        # compare package stays independent of `nemo_gym.cli`.
-        close = difflib.get_close_matches(agent_name, run_file.agent_names, n=1)
         raise ConfigError(
             f"Agent '{agent_name}' is not in '{run_file.aggregate_metrics_fpath}'. "
-            f"Available: {', '.join(run_file.agent_names)}." + (f" Did you mean `{close[0]}`?" if close else "")
+            f"Available: {', '.join(run_file.agent_names)}." + did_you_mean(agent_name, run_file.agent_names)
         )
 
 
