@@ -189,11 +189,7 @@ def _looks_binary(
 
     Uses each task's recorded min/max where available so a task whose repeats disagree (mean 0.5)
     is still recognised as binary. Falls back to mean only when a task has neither min nor max
-    recorded (older files); a task with just one of the two present is judged on that one value
-    rather than being penalized for the other's absence. Note that the mean-only fallback can't
-    distinguish a binary task with disagreeing repeats (mean 0.5) from a genuinely continuous
-    reward near 0.5 -- that ambiguity is inherent to sniffing values after the fact and is not
-    resolved here.
+    recorded.
     """
     for task_index in common:
         for groups in (baseline_groups, candidate_groups):
