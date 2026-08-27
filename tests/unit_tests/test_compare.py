@@ -442,6 +442,32 @@ class TestFlips:
         assert summary.mode == "unavailable"
         assert "mean/reward" in summary.reason
 
+    def test_continuous_mode_only_keeps_reward_lists_for_shown_flips(self, tmp_path):
+        from nemo_gym.comparison.schema import MAX_FLIPS_SHOWN
+
+        num_tasks = MAX_FLIPS_SHOWN + 1
+        baseline = _load(
+            tmp_path,
+            "base",
+            [_entry(groups=[_group(i, [0.5]) for i in range(num_tasks)])],
+        )
+        candidate = _load(
+            tmp_path,
+            "cand",
+            # Distinct deltas so the sort order (largest |delta| first) is deterministic.
+            [_entry(groups=[_group(i, [0.5 + 0.01 * (num_tasks - i)]) for i in range(num_tasks)])],
+            role="candidate",
+        )
+        summary = build_flip_summary(baseline, candidate)
+        assert summary.mode == "continuous"
+        assert len(summary.flips) == num_tasks
+        with_rewards = [flip for flip in summary.flips if flip.baseline_rewards is not None]
+        without_rewards = [flip for flip in summary.flips if flip.baseline_rewards is None]
+        assert len(with_rewards) == MAX_FLIPS_SHOWN
+        assert len(without_rewards) == 1
+        # The dropped flip is the smallest mover, not an arbitrary one.
+        assert without_rewards[0] is summary.flips[-1]
+
     def test_rollout_infos_absent_leaves_per_repeat_rewards_empty(self, tmp_path):
         baseline = _load(tmp_path, "base", [_entry(groups=[_group(0, [1.0], with_rollout_infos=False)])])
         candidate = _load(

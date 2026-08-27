@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 import orjson
 
 from nemo_gym.comparison.schema import (
+    MAX_FLIPS_SHOWN,
     AgentComparison,
     ComparisonResult,
     FlipSummary,
@@ -42,8 +43,6 @@ MARKDOWN_REPORT_NAME = "compare_report.md"
 JSON_REPORT_NAME = "compare_report.json"
 
 MISSING = "—"
-# Flips shown per direction in the markdown; the JSON always carries the full list.
-MAX_FLIPS_SHOWN = 10
 
 CI_FOOTNOTE = (
     "CI = 95% t-interval of the per-repeat mean across repeats, read verbatim from "

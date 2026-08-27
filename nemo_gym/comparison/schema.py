@@ -33,6 +33,10 @@ ReportFormat = Literal["md", "json", "both"]
 # one-line change plus renderer work, not a schema migration.
 MAX_CANDIDATES = 1
 
+# Flips shown per direction in the markdown table, and the cap `diff.py` uses to decide which
+# flips' per-repeat reward lists are worth keeping in the JSON. Shared so the two can't drift.
+MAX_FLIPS_SHOWN = 10
+
 
 class ComparisonConfig(BaseNeMoGymCLIConfig):
     """Compare a baseline eval run against a candidate run.

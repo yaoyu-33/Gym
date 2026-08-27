@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from nemo_gym.comparison.loading import LoadedRun
 from nemo_gym.comparison.schema import (
+    MAX_FLIPS_SHOWN,
     AgentComparison,
     CandidateMetricValue,
     FlipSummary,
@@ -204,6 +205,25 @@ def _looks_binary(
     return True
 
 
+def _cap_reward_lists(flips: List[TaskFlip]) -> List[TaskFlip]:
+    """Null out per-repeat reward lists on flips beyond the per-direction cap the markdown shows.
+
+    Mirrors `report._select_shown_flips`'s per-direction `MAX_FLIPS_SHOWN` cap. Flip counts and the
+    flips themselves are unaffected -- only the "purely illustrative" reward lists are dropped, so
+    `compare_report.json` doesn't scale O(tasks x repeats) when most/all tasks move (continuous
+    mode) or a metric family fans out to hundreds of rows.
+    """
+    counts: Dict[str, int] = {}
+    capped: List[TaskFlip] = []
+    for item in flips:
+        count = counts.get(item.direction, 0)
+        counts[item.direction] = count + 1
+        if count >= MAX_FLIPS_SHOWN:
+            item = item.model_copy(update={"baseline_rewards": None, "candidate_rewards": None})
+        capped.append(item)
+    return capped
+
+
 def _flip_direction(baseline_score: float, candidate_score: float) -> Optional[str]:
     baseline_passed = baseline_score > PASS_THRESHOLD
     candidate_passed = candidate_score > PASS_THRESHOLD
@@ -283,6 +303,7 @@ def build_flip_summary(baseline: LoadedRun, candidate: LoadedRun, *, candidate_i
             if candidate_score != baseline_score
         ]
         movers.sort(key=lambda item: (-abs(item.delta), item.task_index))
+        movers = _cap_reward_lists(movers)
         return FlipSummary(
             candidate_index=candidate_index,
             mode="continuous",
@@ -305,6 +326,7 @@ def build_flip_summary(baseline: LoadedRun, candidate: LoadedRun, *, candidate_i
 
     # Regressions first, then by how far the task moved.
     flips.sort(key=lambda item: (item.direction != "pass_to_fail", -abs(item.delta), item.task_index))
+    flips = _cap_reward_lists(flips)
     pass_to_fail = sum(1 for item in flips if item.direction == "pass_to_fail")
     fail_to_pass = len(flips) - pass_to_fail
     return FlipSummary(
