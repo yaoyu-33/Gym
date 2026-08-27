@@ -1410,15 +1410,16 @@ class TestRolloutCollection:
             {
                 "agent_ref": {"name": "my agent name"},
                 "agent_metrics": {
-                    "mean/abc usage": 1.0,
-                    "max/abc usage": 1,
-                    "min/abc usage": 1,
-                    "median/abc usage": 1.0,
-                    "std/abc usage": 0.0,
+                    "mean/reward": 1.0,
+                    "max/reward": 1.0,
+                    "min/reward": 1.0,
+                    "median/reward": 1.0,
+                    "std/reward": 0.0,
                 },
-                "key_metrics": {"mean/abc usage": 1.0},
+                "key_metrics": {"mean/reward": 1.0},
                 "group_level_metrics": actual_aggregate_metrics[0]["group_level_metrics"],
                 "perf_summary": None,
+                "repeat_level_metrics": [],
             }
         ]
         assert expected_aggregate_metrics == actual_aggregate_metrics
