@@ -135,15 +135,21 @@ def _candidate_metric_value(
 
 
 def build_metric_rows(baseline: LoadedRun, candidates: Sequence[LoadedRun]) -> List[MetricRow]:
-    """One row per metric reported by any side, key metrics flagged."""
-    candidate_metrics = [run.agent_metrics for run in candidates]
+    """One row per metric reported by any side, key metrics flagged.
+
+    `key_metrics` can rename or synthesize names that never appear in `agent_metrics` (e.g. an ASR
+    server's `corpus_wer@k=N` -> `wer`), so rows are built from the union of both, taking the value
+    from `key_metrics` only when `agent_metrics` doesn't already carry that name.
+    """
+    baseline_metrics = {**baseline.key_metrics, **baseline.agent_metrics}
+    candidate_metrics = [{**run.key_metrics, **run.agent_metrics} for run in candidates]
     key_metric_names = set(baseline.key_metrics) | {name for run in candidates for name in run.key_metrics}
 
     rows: List[MetricRow] = []
-    for name in _ordered_metric_names(baseline.agent_metrics, candidate_metrics):
+    for name in _ordered_metric_names(baseline_metrics, candidate_metrics):
         if not is_comparable_metric(name):
             continue
-        baseline_value = _metric_value(baseline.agent_metrics, name)
+        baseline_value = _metric_value(baseline_metrics, name)
         candidate_values = [
             _candidate_metric_value(metrics, name, baseline_value.value if baseline_value else None)
             for metrics in candidate_metrics
