@@ -180,7 +180,7 @@ def _per_repeat_rewards(group: Dict[str, Any]) -> Optional[List[float]]:
         return None
     ordered = sorted(rollout_infos, key=lambda info: info.get(ROLLOUT_INDEX_KEY_NAME, 0))
     rewards = [_numeric(info.get(FLIP_FIELD)) for info in ordered]
-    return None if any(reward is None for reward in rewards) else [reward for reward in rewards if reward is not None]
+    return None if any(reward is None for reward in rewards) else rewards
 
 
 def _looks_binary(
