@@ -19,7 +19,6 @@ from typing import Any, Optional
 from warnings import warn
 
 from fastapi import Body, FastAPI, Request
-from pydantic import Field
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -46,7 +45,6 @@ from nemo_gym.server_utils import (
     apply_rollout_prefix,
     rollout_path_prefix,
 )
-from nemo_gym.token_id_capture.config import NonGeneratingRequest
 
 
 class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
@@ -58,9 +56,6 @@ class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
     # The run-level ``token_id_capture.enabled`` setting gates the capture infrastructure.
     # The run-level ``token_id_capture.all_agents`` setting overrides this agent-level choice.
     token_id_capture: bool = False
-    # Exact metadata or health requests this agent can send to its model server.
-    # Their responses must never contain policy-generated content.
-    token_id_capture_non_generating_requests: list[NonGeneratingRequest] = Field(default_factory=list)
 
 
 class BaseResponsesAPIAgent(BaseServer):

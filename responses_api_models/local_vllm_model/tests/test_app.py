@@ -27,6 +27,9 @@ from responses_api_models.local_vllm_model.app import LocalVLLMModel, LocalVLLMM
 
 
 class TestApp:
+    def test_inner_config_route_is_non_generating(self) -> None:
+        assert ("GET", "/get_inner_vllm_config") in LocalVLLMModel.non_generating_model_routes
+
     def test_sanity_vllm_import(self) -> None:
         import vllm
 
