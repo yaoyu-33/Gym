@@ -25,7 +25,7 @@ from pathlib import Path
 from platform import python_version
 from random import randint
 from socket import gethostbyname, gethostname, socket
-from typing import ClassVar, List, Optional, Tuple, Type
+from typing import ClassVar, Dict, List, Optional, Tuple, Type
 
 import hydra
 import rich
@@ -53,6 +53,7 @@ from nemo_gym.config_types import (
 )
 from nemo_gym.exporters import setup_exporters
 from nemo_gym.secret_utils import recursively_hide_secrets
+from nemo_gym.telemetry.setup import TELEMETRY_KEY_NAME
 
 
 _GLOBAL_CONFIG_DICT = None
@@ -136,6 +137,7 @@ NEMO_GYM_RESERVED_TOP_LEVEL_KEYS = [
     COMPONENT_NAME_KEY_NAME,
     SKIP_VERIFICATION_KEY_NAME,
     SKIP_VERIFICATION_REWARD_KEY_NAME,
+    TELEMETRY_KEY_NAME,
 ]
 
 # Data keys
@@ -151,6 +153,10 @@ ROLLOUT_ID_KEY_NAME = "_ng_rollout_id"
 RESPONSES_CREATE_PARAMS_KEY_NAME = "responses_create_params"
 RESPONSE_KEY_NAME = "response"
 AGENT_REF_KEY_NAME = "agent_ref"
+# The config instance that declares the row's dataset (a resources server normally; the agent
+# itself for self-contained environments). Stamped into derived artifacts at collate/load time;
+# resolved to an agent at dispatch time. See the dataset-decoupling RFC.
+TASK_SOURCE_KEY_NAME = "task_source"
 SKILLS_REF_KEY_NAME = "skills_ref"
 REWARD_KEY_NAME = "reward"
 
@@ -186,6 +192,9 @@ CI_HIGH_95_PREFIX = f"{CI_HIGH_95_STAT_NAME}{STAT_SEPARATOR}"
 ACROSS_REPEATS_MARKER = f"_across_repeats{STAT_SEPARATOR}"
 MEAN_ACROSS_REPEATS_PREFIX = f"{MEAN_STAT_NAME}{ACROSS_REPEATS_MARKER}"
 MEDIAN_ACROSS_REPEATS_PREFIX = f"{MEDIAN_STAT_NAME}{ACROSS_REPEATS_MARKER}"
+STD_ACROSS_REPEATS_PREFIX = f"{STD_STAT_NAME}{ACROSS_REPEATS_MARKER}"
+MIN_ACROSS_REPEATS_PREFIX = f"{MIN_STAT_NAME}{ACROSS_REPEATS_MARKER}"
+MAX_ACROSS_REPEATS_PREFIX = f"{MAX_STAT_NAME}{ACROSS_REPEATS_MARKER}"
 SE_ACROSS_REPEATS_PREFIX = f"se{ACROSS_REPEATS_MARKER}"
 CI_LOW_95_ACROSS_REPEATS_PREFIX = f"{CI_LOW_95_STAT_NAME}{ACROSS_REPEATS_MARKER}"
 CI_HIGH_95_ACROSS_REPEATS_PREFIX = f"{CI_HIGH_95_STAT_NAME}{ACROSS_REPEATS_MARKER}"
@@ -1061,6 +1070,28 @@ def get_first_server_config_dict(global_config_dict: DictConfig, top_level_path:
     server_config_dict = list(server_config_dict.values())[0]
 
     return server_config_dict
+
+
+def agents_by_resources_server(global_config_dict: DictConfig) -> Dict[str, List[str]]:
+    """Invert the agent -> resources_server edges of a merged config.
+
+    Returns {resources server instance name: [agent instance names referencing it]}. This is the
+    lookup that routes task_source-stamped rows to an agent (and, transitionally, lets collate
+    dual-stamp a legacy agent_ref). Template placeholders (``name: ???``) and malformed blocks are
+    skipped: they are not routable candidates.
+    """
+    result: Dict[str, List[str]] = defaultdict(list)
+    for instance_name, block in global_config_dict.items():
+        if not isinstance(block, DictConfig) or "responses_api_agents" not in block:
+            continue
+        try:
+            inner = get_first_server_config_dict(global_config_dict, instance_name)
+            rs_name = (inner.get("resources_server") or {}).get("name")
+        except Exception:
+            continue
+        if isinstance(rs_name, str):
+            result[rs_name].append(str(instance_name))
+    return result
 
 
 def find_open_port(
