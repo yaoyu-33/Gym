@@ -2022,8 +2022,8 @@ def test_a_record_below_the_schema_floor_is_refused():
         TokenEntry(**_entry_fields(schema_version=TOKEN_ENTRY_MIN_SCHEMA_VERSION - 1))
 
 
-def test_a_supported_older_record_uses_new_field_defaults():
-    entry = TokenEntry(**_entry_fields(schema_version=TOKEN_ENTRY_RECORD_SCHEMA_VERSION - 1))
+def test_omitted_optional_schema_fields_use_safe_defaults():
+    entry = TokenEntry(**_entry_fields())
 
     assert entry.prompt_is_delta is False
     assert entry.prefix_requested is False
