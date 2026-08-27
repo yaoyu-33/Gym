@@ -26,6 +26,7 @@ from nemo_gym.comparison.loading import build_loaded_run, load_agg_metrics_file,
 from nemo_gym.comparison.report import write_reports
 from nemo_gym.comparison.schema import ComparisonConfig, ComparisonResult
 from nemo_gym.package_info import __version__
+from nemo_gym.secret_utils import redact_secret_overrides
 
 
 def invoked_command() -> str:
@@ -33,8 +34,9 @@ def invoked_command() -> str:
 
     `dispatch` rewrites `sys.argv` to the resolved Hydra overrides before the entry point runs, so
     this records the resolved form -- which reproduces the run -- rather than the flags as typed.
+    Overrides whose key looks secret-shaped are masked before being persisted into the report.
     """
-    return shlex.join(["gym", "eval", "compare", *sys.argv[1:]])
+    return shlex.join(["gym", "eval", "compare", *redact_secret_overrides(sys.argv[1:])])
 
 
 def build_comparison_result(config: ComparisonConfig, command: str) -> ComparisonResult:

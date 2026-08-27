@@ -12,7 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
+from typing import List
+
 from omegaconf import DictConfig, ListConfig, open_dict
+
+
+MASKED_VALUE = "****"
+
+
+def looks_like_secret_key(key: str) -> bool:
+    """Whether a config/override key name looks like it holds a secret (a token or an API key)."""
+    return "token" in key or "key" in key
+
+
+def redact_secret_overrides(tokens: List[str]) -> List[str]:
+    """Mask `+key=value` / `++key=value` tokens whose key looks secret-shaped.
+
+    The global config accepts arbitrary `+key=value` overrides on any command. Commands that
+    persist their resolved invocation for provenance (e.g. `gym eval compare`'s report) can use
+    this to avoid leaking a secret-bearing override passed alongside on the command line.
+    """
+    override_re = re.compile(r"^(\+{1,2})([^=]+)=(.*)$")
+    redacted = []
+    for token in tokens:
+        match = override_re.match(token)
+        if match:
+            prefix, key, _value = match.groups()
+            if looks_like_secret_key(key.rsplit(".", 1)[-1]):
+                token = f"{prefix}{key}={MASKED_VALUE}"
+        redacted.append(token)
+    return redacted
 
 
 def recursively_hide_secrets(dict_config: DictConfig) -> None:
@@ -26,15 +56,15 @@ def recursively_hide_secrets(dict_config: DictConfig) -> None:
             if isinstance(v, (DictConfig, dict)):
                 hide(v)
             elif isinstance(v, (ListConfig, list)):
-                if "token" in k or "key" in k:
-                    node[k] = ["****"] * len(v)
+                if looks_like_secret_key(k):
+                    node[k] = [MASKED_VALUE] * len(v)
                 else:
                     for inner_v in v:
                         if isinstance(inner_v, (DictConfig, dict)):
                             hide(inner_v)
             else:
-                if "token" in k or "key" in k:
-                    node[k] = "****"
+                if looks_like_secret_key(k):
+                    node[k] = MASKED_VALUE
 
     with open_dict(dict_config):
         hide(dict_config)

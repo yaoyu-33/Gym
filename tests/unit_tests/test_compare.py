@@ -752,6 +752,25 @@ class TestEndToEnd:
         monkeypatch.setattr("sys.argv", ["gym", "+baseline_rollouts_jsonl_fpath=a b.jsonl"])
         assert invoked_command() == "gym eval compare '+baseline_rollouts_jsonl_fpath=a b.jsonl'"
 
+    def test_invoked_command_redacts_secret_shaped_overrides(self, monkeypatch):
+        from nemo_gym.comparison.runner import invoked_command
+
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "gym",
+                "+baseline_rollouts_jsonl_fpath=a.jsonl",
+                "++policy_api_key=sk-super-secret",
+                "++some.nested.hf_token=hf_super_secret",
+            ],
+        )
+        command = invoked_command()
+        assert "sk-super-secret" not in command
+        assert "hf_super_secret" not in command
+        assert "+baseline_rollouts_jsonl_fpath=a.jsonl" in command
+        assert "++policy_api_key=****" in command
+        assert "++some.nested.hf_token=****" in command
+
     def test_key_metrics_table_is_rendered_per_agent(self, tmp_path):
         from nemo_gym.comparison.report import render_key_metrics_tables
 
