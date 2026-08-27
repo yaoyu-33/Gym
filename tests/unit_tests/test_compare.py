@@ -314,6 +314,7 @@ class TestMetricRows:
             ("mean_across_repeats/mean/reward", False),
             ("ci_high_95_across_repeats/mean/reward", False),
             ("pass@1[avg-of-3]/accuracy/std_err_across_runs", False),
+            ("pass@1[avg-of-3]/accuracy/avg_sample_std_dev", False),
         ],
     )
     def test_only_real_metrics_get_a_row(self, name, comparable):
@@ -378,6 +379,39 @@ class TestMetricRows:
         assert rows["pass@2/accuracy"].present_in == ["candidate[0]"]
         assert rows["mean/reward"].present_in == ["baseline", "candidate[0]"]
 
+    def test_key_metrics_only_name_still_gets_a_row(self, tmp_path):
+        """key_metrics can rename or synthesize a name that never appears in agent_metrics (e.g. an
+        ASR server renaming corpus_wer@k=N -> wer). That name must still earn a row, flagged as a
+        key metric, not silently vanish."""
+        baseline = _load(
+            tmp_path,
+            "base",
+            [_entry(agent_metrics={"corpus_wer@k=4": 12.5}, key_metrics={"wer": 12.5})],
+        )
+        candidate = _load(
+            tmp_path,
+            "cand",
+            [_entry(agent_metrics={"corpus_wer@k=4": 10.0}, key_metrics={"wer": 10.0})],
+            role="candidate",
+        )
+        rows = {row.metric: row for row in build_metric_rows(baseline, [candidate])}
+        assert "wer" in rows
+        assert rows["wer"].is_key_metric
+        assert rows["wer"].baseline.value == pytest.approx(12.5)
+        assert rows["wer"].candidates[0].value == pytest.approx(10.0)
+        assert rows["wer"].candidates[0].delta == pytest.approx(-2.5)
+
+    def test_key_metrics_name_shared_with_agent_metrics_prefers_the_agent_metrics_value(self, tmp_path):
+        """On a name collision, the agent_metrics value wins (it's the one CI/std-err lookups key
+        off of); key_metrics only fills in names agent_metrics doesn't already have."""
+        baseline = _load(
+            tmp_path,
+            "base",
+            [_entry(agent_metrics={"mean/reward": 0.5}, key_metrics={"mean/reward": 0.999})],
+        )
+        (row,) = build_metric_rows(baseline, [])
+        assert row.baseline.value == pytest.approx(0.5)
+
 
 class TestFlips:
     def test_binary_mode_counts_flips_in_both_directions(self, tmp_path):
@@ -394,6 +428,7 @@ class TestFlips:
         )
         summary = build_flip_summary(baseline, candidate)
         assert summary.mode == "binary"
+        assert summary.field == "reward"
         assert (summary.pass_to_fail_count, summary.fail_to_pass_count) == (1, 1)
         assert summary.unchanged_count == 1 and summary.net == 0
         # Regressions are listed first.
@@ -482,9 +517,19 @@ class TestFlips:
 
 class TestCompareRuns:
     def test_no_shared_metrics_is_fatal(self, tmp_path):
-        baseline = _load(tmp_path, "base", [_entry(agent_metrics={"pass@1[avg-of-3]/accuracy": 40.0})])
+        # key_metrics must be disjoint too (not just agent_metrics): build_metric_rows folds
+        # key_metrics into the compared metrics, so leaving them at _entry()'s shared default would
+        # give the two runs an overlapping "mean/reward" key and this wouldn't be fatal anymore.
+        baseline = _load(
+            tmp_path,
+            "base",
+            [_entry(agent_metrics={"pass@1[avg-of-3]/accuracy": 40.0}, key_metrics={})],
+        )
         candidate = _load(
-            tmp_path, "cand", [_entry(agent_metrics={"pass@1[avg-of-5]/accuracy": 44.0})], role="candidate"
+            tmp_path,
+            "cand",
+            [_entry(agent_metrics={"pass@1[avg-of-5]/accuracy": 44.0}, key_metrics={})],
+            role="candidate",
         )
         with pytest.raises(ConfigError, match="share no metric keys"):
             compare_runs(baseline, [candidate])
@@ -918,6 +963,21 @@ class TestReportEdgeCases:
         summary = build_flip_summary(
             _load(tmp_path / "fb", "base", [_entry(groups=baseline_groups)]),
             _load(tmp_path / "fb", "cand", [_entry(groups=candidate_groups)], role="candidate"),
+        )
+        assert summary.mode == "binary"
+        assert summary.pass_to_fail_count == 1
+
+    def test_binary_detection_survives_a_task_missing_only_one_of_min_or_max(self, tmp_path):
+        """A task recording just one of min/reward, max/reward (not neither) must still be read as
+        binary -- the missing companion must not make the whole comparison look continuous."""
+        baseline_groups = [_group(0, [1.0, 1.0]), _group(1, [0.0, 0.0])]
+        candidate_groups = [_group(0, [0.0, 0.0]), _group(1, [0.0, 0.0])]
+        # Drop only `max/reward` from task 0's group on each side; `min/reward` is still present.
+        baseline_groups[0].pop("max/reward")
+        candidate_groups[0].pop("max/reward")
+        summary = build_flip_summary(
+            _load(tmp_path / "asym", "base", [_entry(groups=baseline_groups)]),
+            _load(tmp_path / "asym", "cand", [_entry(groups=candidate_groups)], role="candidate"),
         )
         assert summary.mode == "binary"
         assert summary.pass_to_fail_count == 1
