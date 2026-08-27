@@ -22,17 +22,11 @@ MASKED_VALUE = "****"
 
 
 def looks_like_secret_key(key: str) -> bool:
-    """Whether a config/override key name looks like it holds a secret (a token or an API key)."""
     return "token" in key or "key" in key
 
 
 def redact_secret_overrides(tokens: List[str]) -> List[str]:
-    """Mask `+key=value` / `++key=value` tokens whose key looks secret-shaped.
-
-    The global config accepts arbitrary `+key=value` overrides on any command. Commands that
-    persist their resolved invocation for provenance (e.g. `gym eval compare`'s report) can use
-    this to avoid leaking a secret-bearing override passed alongside on the command line.
-    """
+    """Mask `+key=value` / `++key=value` tokens whose key looks secret-shaped."""
     override_re = re.compile(r"^(\+{1,2})([^=]+)=(.*)$")
     redacted = []
     for token in tokens:

@@ -30,12 +30,7 @@ from nemo_gym.secret_utils import redact_secret_overrides
 
 
 def invoked_command() -> str:
-    """The `gym eval compare` invocation, for provenance in the report.
-
-    `dispatch` rewrites `sys.argv` to the resolved Hydra overrides before the entry point runs, so
-    this records the resolved form -- which reproduces the run -- rather than the flags as typed.
-    Overrides whose key looks secret-shaped are masked before being persisted into the report.
-    """
+    """The `gym eval compare` invocation, for provenance in the report."""
     return shlex.join(["gym", "eval", "compare", *redact_secret_overrides(sys.argv[1:])])
 
 
