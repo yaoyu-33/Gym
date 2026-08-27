@@ -26,12 +26,12 @@ from nemo_gym.comparison.loading import build_loaded_run, load_agg_metrics_file,
 from nemo_gym.comparison.report import write_reports
 from nemo_gym.comparison.schema import ComparisonConfig, ComparisonResult
 from nemo_gym.package_info import __version__
-from nemo_gym.secret_utils import redact_secret_overrides
+from nemo_gym.secret_utils import hide_secrets_in_overrides
 
 
 def invoked_command() -> str:
     """The `gym eval compare` invocation, for provenance in the report."""
-    return shlex.join(["gym", "eval", "compare", *redact_secret_overrides(sys.argv[1:])])
+    return shlex.join(["gym", "eval", "compare", *hide_secrets_in_overrides(sys.argv[1:])])
 
 
 def build_comparison_result(config: ComparisonConfig, command: str) -> ComparisonResult:

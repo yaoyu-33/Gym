@@ -25,7 +25,7 @@ def looks_like_secret_key(key: str) -> bool:
     return "token" in key or "key" in key
 
 
-def redact_secret_overrides(tokens: List[str]) -> List[str]:
+def hide_secrets_in_overrides(tokens: List[str]) -> List[str]:
     """Mask `+key=value` / `++key=value` tokens whose key looks secret-shaped."""
     override_re = re.compile(r"^(\+{1,2})([^=]+)=(.*)$")
     redacted = []
