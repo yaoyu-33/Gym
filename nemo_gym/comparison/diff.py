@@ -32,6 +32,7 @@ from nemo_gym.comparison.schema import (
 from nemo_gym.config_types import ConfigError
 from nemo_gym.global_config import (
     ACROSS_REPEATS_MARKER,
+    AVG_SAMPLE_STD_DEV_SUFFIX,
     CI_HIGH_95_ACROSS_REPEATS_PREFIX,
     CI_HIGH_95_PREFIX,
     CI_LOW_95_ACROSS_REPEATS_PREFIX,
@@ -69,7 +70,7 @@ DISPERSION_PREFIXES = (
     CI_HIGH_95_PREFIX,
 )
 # Companion statistics of the `pass@k` family, likewise not metrics of their own.
-STAT_SUFFIXES = (STD_DEV_ACROSS_RUNS_SUFFIX, STD_ERR_ACROSS_RUNS_SUFFIX)
+STAT_SUFFIXES = (STD_DEV_ACROSS_RUNS_SUFFIX, STD_ERR_ACROSS_RUNS_SUFFIX, AVG_SAMPLE_STD_DEV_SUFFIX)
 
 # The per-task field flips are computed from. Every verify response carries `reward` at minimum.
 FLIP_FIELD = REWARD_KEY_NAME
