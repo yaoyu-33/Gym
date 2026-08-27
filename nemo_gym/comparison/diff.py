@@ -244,6 +244,7 @@ def build_flip_summary(baseline: LoadedRun, candidate: LoadedRun, *, candidate_i
     candidate_groups = _groups_by_task(candidate)
     common = sorted(set(baseline_groups) & set(candidate_groups))
     counts = {
+        "field": FLIP_FIELD,
         "common_task_count": len(common),
         "baseline_only_task_count": len(set(baseline_groups) - set(candidate_groups)),
         "candidate_only_task_count": len(set(candidate_groups) - set(baseline_groups)),
