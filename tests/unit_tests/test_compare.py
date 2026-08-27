@@ -734,7 +734,7 @@ class TestEndToEnd:
         assert table.title == f"Key metrics — {AGENT}"
         assert [column.header for column in table.columns] == [
             "Metric",
-            "Drop (cand - base)",
+            "Δ (cand − base)",
             "Baseline",
             "Baseline 95% CI",
             "Candidate",
@@ -792,9 +792,7 @@ class TestEndToEnd:
         markdown = render_markdown(result)
         assert "# gym eval compare" in markdown
         assert "### Key metrics" in markdown
-        assert (
-            "| Metric | Drop (cand − base) | Baseline | Baseline 95% CI | Candidate | Candidate 95% CI |" in markdown
-        )
+        assert "| Metric | Δ (cand − base) | Baseline | Baseline 95% CI | Candidate | Candidate 95% CI |" in markdown
         # A metric with no recorded interval renders an em dash rather than a fabricated one.
         assert "| `pass@1[avg-of-2]/accuracy` | -50.00 (-66.7%) | 75.00 | — | 25.00 | — |" in markdown
         assert "| `mean/reward` | -0.5000 (-66.7%) | 0.7500 | [0.7000, 0.8000] | 0.2500 | — |" in markdown

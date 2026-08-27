@@ -136,8 +136,11 @@ def _run_summary_table(result: ComparisonResult, comparison: AgentComparison) ->
     return _table(header, alignments, rows)
 
 
+DELTA_HEADER = "Δ (cand − base)"
+
+
 def _metric_table(rows: Sequence[MetricRow], candidate_labels: Sequence[str]) -> List[str]:
-    header = ["Metric", "Drop (cand − base)"]
+    header = ["Metric", DELTA_HEADER]
     alignments = ["---", "---:"]
     header += ["Baseline", "Baseline 95% CI"]
     alignments += ["---:", "---"]
@@ -331,7 +334,7 @@ def render_key_metrics_tables(result: ComparisonResult) -> List["Table"]:
     for comparison in result.comparisons:
         table = Table(title=f"Key metrics — {comparison.baseline_agent}")
         table.add_column("Metric")
-        table.add_column("Drop (cand - base)", justify="right")
+        table.add_column(DELTA_HEADER, justify="right")
         table.add_column("Baseline", justify="right")
         table.add_column("Baseline 95% CI")
         table.add_column("Candidate", justify="right")
