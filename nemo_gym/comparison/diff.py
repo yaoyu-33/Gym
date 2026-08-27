@@ -188,13 +188,18 @@ def _looks_binary(
     """Whether every observed reward on both sides is exactly 0 or 1.
 
     Uses each task's recorded min/max where available so a task whose repeats disagree (mean 0.5)
-    is still recognised as binary.
+    is still recognised as binary. Falls back to mean only when a task has neither min nor max
+    recorded (older files); a task with just one of the two present is judged on that one value
+    rather than being penalized for the other's absence. Note that the mean-only fallback can't
+    distinguish a binary task with disagreeing repeats (mean 0.5) from a genuinely continuous
+    reward near 0.5 -- that ambiguity is inherent to sniffing values after the fact and is not
+    resolved here.
     """
     for task_index in common:
         for groups in (baseline_groups, candidate_groups):
             group = groups[task_index]
-            observed = [group.get(TASK_MIN_KEY), group.get(TASK_MAX_KEY)]
-            if all(value is None for value in observed):
+            observed = [value for value in (group.get(TASK_MIN_KEY), group.get(TASK_MAX_KEY)) if value is not None]
+            if not observed:
                 observed = [group.get(TASK_MEAN_KEY)]
             for value in observed:
                 number = _numeric(value)
