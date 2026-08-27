@@ -24,7 +24,7 @@ import yaml
 
 import nemo_gym.rollout_collection
 from nemo_gym.base_resources_server import AggregateMetrics, AggregateMetricsRequest
-from nemo_gym.config_types import ConfigError, ConfigPathNotFoundError
+from nemo_gym.config_types import AggregateMetricScope, ConfigError, ConfigPathNotFoundError
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ORCHESTRATOR_REF_KEY_NAME,
@@ -902,6 +902,7 @@ class TestRolloutCollection:
                 },
                 "key_metrics": {"mean/abc usage": 1.0},
                 "group_level_metrics": actual_aggregate_metrics[0]["group_level_metrics"],
+                "per_agent_metrics": {},
             }
         ]
         assert expected_aggregate_metrics == actual_aggregate_metrics
@@ -1272,13 +1273,28 @@ class TestRolloutCollection:
 
         assert expected_results == actual_returned_results
 
-    async def test_call_aggregate_metrics(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def test_call_aggregate_metrics(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
         """Test _call_aggregate_metrics with a mocked server client."""
 
         agg = AggregateMetrics(
             agent_metrics={"mean/reward": 0.5},
             key_metrics={"mean/reward": 0.5},
             group_level_metrics=[{"mean/reward": 1.0}, {"mean/reward": 0.0}],
+            per_agent_metrics={
+                "player0": AggregateMetricScope(
+                    metrics={"mean/reward": -0.5},
+                    key_metrics={"mean/reward": -0.5},
+                ),
+                "player1": AggregateMetricScope(
+                    metrics={"mean/reward": 0.5},
+                    key_metrics={"mean/reward": 0.5},
+                ),
+            },
         )
 
         mock_response = AsyncMock()
@@ -1327,6 +1343,11 @@ class TestRolloutCollection:
         assert written[0]["agent_metrics"]["mean/reward"] == 0.5
         assert written[0]["key_metrics"]["mean/reward"] == 0.5
         assert len(written[0]["group_level_metrics"]) == 2
+        assert written[0]["per_agent_metrics"]["player0"]["key_metrics"]["mean/reward"] == -0.5
+        assert written[0]["per_agent_metrics"]["player1"]["key_metrics"]["mean/reward"] == 0.5
+        output = capsys.readouterr().out
+        assert "Key metrics for my_agent/player0" in output
+        assert "Key metrics for my_agent/player1" in output
 
         # Verify server_client.post was called with stripped data (usage preserved)
         call_kwargs = mock_server_client.post.call_args

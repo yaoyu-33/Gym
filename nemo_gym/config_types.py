@@ -796,6 +796,14 @@ class AggregateMetricsRequest(BaseModel):
     verify_responses: List[Dict[str, Any]]
 
 
+class AggregateMetricScope(BaseModel):
+    """Aggregate metrics for one participant within a rollout target."""
+
+    group_level_metrics: List[Dict[str, Any]] = Field(default_factory=list)
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    key_metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
 class AggregateMetrics(BaseModel):
     """Response from /aggregate_metrics.
 
@@ -813,6 +821,10 @@ class AggregateMetrics(BaseModel):
     key_metrics: Dict[str, Any] = Field(
         default_factory=dict,
         description="Headline metrics for this benchmark. Subset of agent_metrics.",
+    )
+    per_agent_metrics: Dict[str, AggregateMetricScope] = Field(
+        default_factory=dict,
+        description="Metrics grouped by participant ID for multi-agent rollouts.",
     )
 
 
