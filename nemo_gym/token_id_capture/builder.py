@@ -206,26 +206,40 @@ def _materialize_delta_prompts(entries: list[TokenEntry]) -> tuple[list[TokenEnt
     by_id = {entry.model_call_id: entry for entry in entries}
     cumulative: dict[str, list[int] | None] = {}
 
-    def cum_of(call_id: str, walking: set[str]) -> list[int] | None:
+    def cum_of(call_id: str) -> list[int] | None:
         if call_id in cumulative:
             return cumulative[call_id]
-        entry = by_id.get(call_id)
-        if entry is None or call_id in walking:
-            cumulative[call_id] = None
+
+        path: list[TokenEntry] = []
+        seen: set[str] = set()
+        current_id = call_id
+        while current_id not in cumulative:
+            if current_id in seen or len(path) > 10_000:
+                cumulative[current_id] = None
+                break
+            seen.add(current_id)
+            entry = by_id.get(current_id)
+            if entry is None:
+                cumulative[current_id] = None
+                break
+            if not entry.prompt_is_delta:
+                cumulative[current_id] = list(entry.prompt_token_ids) + list(entry.generation_token_ids)
+                break
+            path.append(entry)
+            if entry.parent_call_id is None:
+                cumulative[current_id] = None
+                break
+            current_id = entry.parent_call_id
+
+        value = cumulative[current_id]
+        if value is None:
+            for entry in path:
+                cumulative[entry.model_call_id] = None
             return None
-        walking.add(call_id)
-        if not entry.prompt_is_delta:
-            value = list(entry.prompt_token_ids) + list(entry.generation_token_ids)
-        else:
-            parent_cum = cum_of(entry.parent_call_id, walking) if entry.parent_call_id else None
-            value = (
-                None
-                if parent_cum is None
-                else parent_cum + list(entry.prompt_token_ids) + list(entry.generation_token_ids)
-            )
-        walking.discard(call_id)
-        cumulative[call_id] = value
-        return value
+        for entry in reversed(path):
+            value = value + list(entry.prompt_token_ids) + list(entry.generation_token_ids)
+            cumulative[entry.model_call_id] = value
+        return cumulative[call_id]
 
     materialized: list[TokenEntry] = []
     broken: list[str] = []
@@ -233,7 +247,7 @@ def _materialize_delta_prompts(entries: list[TokenEntry]) -> tuple[list[TokenEnt
         if not entry.prompt_is_delta:
             materialized.append(entry)
             continue
-        cum = cum_of(entry.model_call_id, set())
+        cum = cum_of(entry.model_call_id)
         if cum is None:
             broken.append(entry.model_call_id)
             continue

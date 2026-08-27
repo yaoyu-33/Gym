@@ -153,13 +153,13 @@ class TokenEntry(BaseModel):
     # A resolver must not match records stamped by a different algorithm.
     fingerprint_version: int | None = None
 
-    # Delta storage was added in schema version 5.
+    # Delta storage is part of the initial record schema.
     # A delta prompt stores only the suffix after the resolved parent.
     # Root and unresolved records always store full prompts.
     # This guarantees that every reconstructable chain has a full-prompt anchor.
     prompt_is_delta: bool = False
 
-    # Prefix supply fields were added in schema version 4.
+    # Prefix supply fields are part of the initial record schema.
     # Request intent is distinct from generation-time proof.
     prefix_requested: bool = False
     # This is true only when generation-time prompt_token_ids prove prefix application.
