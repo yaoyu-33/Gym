@@ -206,12 +206,9 @@ def _looks_binary(
 
 
 def _cap_reward_lists(flips: List[TaskFlip]) -> List[TaskFlip]:
-    """Null out per-repeat reward lists on flips beyond the per-direction cap the markdown shows.
-
-    Mirrors `report._select_shown_flips`'s per-direction `MAX_FLIPS_SHOWN` cap. Flip counts and the
-    flips themselves are unaffected -- only the "purely illustrative" reward lists are dropped, so
+    """Null out per-repeat reward lists on flips beyond the per-direction cap the markdown shows, so
     `compare_report.json` doesn't scale O(tasks x repeats) when most/all tasks move (continuous
-    mode) or a metric family fans out to hundreds of rows.
+    mode).
     """
     counts: Dict[str, int] = {}
     capped: List[TaskFlip] = []
