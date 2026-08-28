@@ -73,14 +73,56 @@ class OpenAIModelClient:
     Training-ready trajectories additionally require the endpoint to return
     ``prompt_token_ids``, ``generation_token_ids``, and
     ``generation_log_probs`` on ``choices[0].message``. NeMo-RL's exposed vLLM
-    endpoint implements this extension so Gym does not need to re-tokenize a
-    response and risk training/inference token drift.
+    endpoint implements this extension. Stock vLLM can provide the same exact
+    data when ``vllm_token_ids=True``: generation IDs come from token-ID
+    logprobs and prompt IDs come from its server-side ``/tokenize`` endpoint.
+    Both modes avoid local re-tokenization and training/inference token drift.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        *,
+        vllm_token_ids: bool = False,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._api_key = api_key
+        self._vllm_token_ids = vllm_token_ids
+
+    @property
+    def _headers(self) -> dict[str, str] | None:
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+
+    async def _vllm_prompt_token_ids(self, messages: Messages) -> list[int]:
+        api_root = self._base_url.removesuffix("/v1")
+        response = await request(
+            method="POST",
+            url=f"{api_root}/tokenize",
+            json={"model": self._model, "messages": [dict(message) for message in messages]},
+            headers=self._headers,
+        )
+        await raise_for_status(response)
+        response_body = await get_response_json(response)
+        tokens = response_body.get("tokens") if isinstance(response_body, dict) else None
+        if not isinstance(tokens, list) or any(not isinstance(token, int) for token in tokens):
+            raise ValueError("vLLM /tokenize response has no integer tokens array")
+        return tokens
+
+    @staticmethod
+    def _vllm_generation_data(choice: Mapping[str, Any]) -> tuple[list[int], list[float]]:
+        logprob_items = (choice.get("logprobs") or {}).get("content") or []
+        token_ids: list[int] = []
+        logprobs: list[float] = []
+        for item in logprob_items:
+            token = item.get("token") if isinstance(item, dict) else None
+            if not isinstance(token, str) or not token.startswith("token_id:"):
+                raise ValueError("vLLM did not return token-ID logprobs")
+            token_ids.append(int(token.removeprefix("token_id:")))
+            logprobs.append(float(item["logprob"]))
+        return token_ids, logprobs
 
     async def generate(
         self,
@@ -98,24 +140,33 @@ class OpenAIModelClient:
             "logprobs": True,
             **sampling,
         }
-        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+        if self._vllm_token_ids:
+            payload["return_tokens_as_token_ids"] = True
         response = await request(
             method="POST",
             url=f"{self._base_url}/chat/completions",
             json=payload,
-            headers=headers,
+            headers=self._headers,
         )
         await raise_for_status(response)
         response_body = await get_response_json(response)
         try:
-            message = dict(response_body["choices"][0]["message"])
+            choice = response_body["choices"][0]
+            message = dict(choice["message"])
         except (IndexError, KeyError, TypeError) as exc:
             raise ValueError("Chat Completions response has no choices[0].message") from exc
+        prompt_token_ids = message.pop("prompt_token_ids", None)
+        generation_token_ids = message.pop("generation_token_ids", None)
+        generation_logprobs = message.pop("generation_log_probs", None)
+        if self._vllm_token_ids and prompt_token_ids is None:
+            prompt_token_ids = await self._vllm_prompt_token_ids(messages)
+        if self._vllm_token_ids and generation_token_ids is None:
+            generation_token_ids, generation_logprobs = self._vllm_generation_data(choice)
         return ModelOutput(
             message=message,
-            prompt_token_ids=message.pop("prompt_token_ids", None),
-            generation_token_ids=message.pop("generation_token_ids", None),
-            generation_logprobs=message.pop("generation_log_probs", None),
+            prompt_token_ids=prompt_token_ids,
+            generation_token_ids=generation_token_ids,
+            generation_logprobs=generation_logprobs,
             raw_response=response_body,
         )
 

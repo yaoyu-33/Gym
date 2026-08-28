@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from nemo_gym.trajectory_runtime import ModelOutput, Trajectory, TrajectoryRunner
+from nemo_gym.trajectory_runtime import ModelOutput, OpenAIModelClient, Trajectory, TrajectoryRunner
 
 
 class FakeModelClient:
@@ -54,3 +54,19 @@ async def test_runner_streams_training_ready_trajectories_as_completed():
 def test_trajectory_rejects_misaligned_training_fields():
     with pytest.raises(ValidationError, match="loss_mask must be present and aligned"):
         Trajectory(task_id="task", sample_id="task:0", input_ids=[1, 2], loss_mask=[1])
+
+
+def test_vllm_token_id_logprobs_are_projected_without_retokenizing():
+    token_ids, logprobs = OpenAIModelClient._vllm_generation_data(
+        {
+            "logprobs": {
+                "content": [
+                    {"token": "token_id:12", "logprob": -0.1},
+                    {"token": "token_id:13", "logprob": -0.2},
+                ]
+            }
+        }
+    )
+
+    assert token_ids == [12, 13]
+    assert logprobs == [-0.1, -0.2]
