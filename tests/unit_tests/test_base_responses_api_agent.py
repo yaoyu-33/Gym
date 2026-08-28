@@ -16,12 +16,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nemo_gym.base_resources_server import AggregateMetricsRequest
+from nemo_gym.base_resources_server import (
+    AggregateMetricsRequest,
+    BaseRunRequest,
+    BaseVerifyResponse,
+)
 from nemo_gym.base_responses_api_agent import (
     BaseResponsesAPIAgent,
     BaseResponsesAPIAgentConfig,
     SimpleResponsesAPIAgent,
 )
+from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.server_utils import ServerClient
 
 
@@ -102,3 +107,40 @@ class TestBaseResponsesAPIAgent:
         assert self._agent(gc, token_id_capture=True).rollout_id_from_run(body) == "0-0"
         # Agent opt-in alone does not enable capture.
         assert self._agent({}, token_id_capture=True).rollout_id_from_run(body) is None
+
+    def test_requested_trajectory_is_attached_to_run_result(self) -> None:
+        body = BaseRunRequest.model_validate(
+            {
+                "_ng_trajectory_version": 1,
+                "responses_create_params": {
+                    "input": [{"role": "user", "content": "2 + 2?"}],
+                    "metadata": {"task_id": "arithmetic"},
+                },
+            }
+        )
+        response = NeMoGymResponse.model_construct(
+            id="resp-1",
+            output=[
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "prompt_token_ids": [10, 11],
+                    "generation_token_ids": [12],
+                    "generation_log_probs": [-0.1],
+                }
+            ],
+        )
+        result = BaseVerifyResponse(
+            responses_create_params=body.responses_create_params,
+            response=response,
+            reward=1.0,
+        )
+
+        attached = self._agent({})._attach_requested_trajectory(body, result)
+
+        assert attached.trajectory is not None
+        assert attached.trajectory.task_id == "arithmetic"
+        assert attached.trajectory.input_ids == [10, 11, 12]
+        assert attached.trajectory.loss_mask == [0, 0, 1]
+        assert "_ng_trajectory_version" not in body.model_dump(by_alias=True)

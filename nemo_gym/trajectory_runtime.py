@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Messages = Sequence[Mapping[str, Any]]
 SamplingParams = Mapping[str, Any]
+TRAJECTORY_SCHEMA_VERSION = 1
 
 
 class ModelOutput(BaseModel):
@@ -185,6 +186,7 @@ class Trajectory(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    schema_version: int = TRAJECTORY_SCHEMA_VERSION
     task_id: str
     sample_id: str
     input_ids: list[int] | None = None
@@ -198,6 +200,10 @@ class Trajectory(BaseModel):
 
     @model_validator(mode="after")
     def validate_training_arrays(self) -> "Trajectory":
+        if self.schema_version != TRAJECTORY_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported trajectory schema_version {self.schema_version}; expected {TRAJECTORY_SCHEMA_VERSION}"
+            )
         if self.input_ids is None:
             if self.loss_mask is not None or self.logprobs is not None:
                 raise ValueError("loss_mask and logprobs require input_ids")
@@ -209,6 +215,100 @@ class Trajectory(BaseModel):
         if self.logprobs is not None and len(self.logprobs) != len(self.input_ids):
             raise ValueError("logprobs must be aligned with input_ids")
         return self
+
+    @classmethod
+    def from_responses(
+        cls,
+        *,
+        task_id: str,
+        sample_id: str,
+        messages: Messages,
+        response: Mapping[str, Any],
+        reward: float | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Trajectory":
+        """Project a token-bearing Responses rollout into one training trajectory.
+
+        Each generated output item carries the cumulative prompt seen by that
+        model call. This projection retains only the newly appended prompt tokens
+        between calls, marks them non-trainable, and marks the sampled generation
+        trainable. It therefore supports multi-turn and tool-interleaved rollouts
+        without re-tokenizing any content.
+        """
+        input_ids: list[int] = []
+        loss_mask: list[int] = []
+        logprobs: list[float] = []
+        seen_token_ids: list[int] = []
+        steps: list[dict[str, Any]] = []
+
+        for raw_item in response.get("output", []):
+            if not isinstance(raw_item, Mapping):
+                continue
+            item = dict(raw_item)
+            token_fields = (
+                item.get("prompt_token_ids"),
+                item.get("generation_token_ids"),
+                item.get("generation_log_probs"),
+            )
+            if all(value is None for value in token_fields):
+                continue
+            if not all(isinstance(value, list) for value in token_fields):
+                raise ValueError("Responses output item has partial token metadata")
+            prompt_token_ids, generation_token_ids, generation_logprobs = token_fields
+            if any(not isinstance(token_id, int) for token_id in prompt_token_ids):
+                raise ValueError("prompt_token_ids must contain only integers")
+            if any(not isinstance(token_id, int) for token_id in generation_token_ids):
+                raise ValueError("generation_token_ids must contain only integers")
+            if len(generation_token_ids) != len(generation_logprobs):
+                raise ValueError("generation_token_ids and generation_log_probs must align")
+            if seen_token_ids != prompt_token_ids[: len(seen_token_ids)]:
+                raise ValueError("Responses token metadata is not prefix-contiguous")
+
+            new_prompt_token_ids = prompt_token_ids[len(seen_token_ids) :]
+            input_ids.extend(new_prompt_token_ids)
+            loss_mask.extend([0] * len(new_prompt_token_ids))
+            logprobs.extend([0.0] * len(new_prompt_token_ids))
+            generation_start = len(input_ids)
+            input_ids.extend(generation_token_ids)
+            loss_mask.extend([1] * len(generation_token_ids))
+            logprobs.extend(float(value) for value in generation_logprobs)
+            generation_end = len(input_ids)
+
+            semantic_item = {
+                key: value
+                for key, value in item.items()
+                if key
+                not in {
+                    "prompt_token_ids",
+                    "generation_token_ids",
+                    "generation_log_probs",
+                }
+            }
+            steps.append(
+                {
+                    "type": "model",
+                    "output": semantic_item,
+                    "generation_span": [generation_start, generation_end],
+                }
+            )
+            seen_token_ids = list(prompt_token_ids) + list(generation_token_ids)
+
+        semantic_messages = [dict(message) for message in messages]
+        semantic_messages.extend(dict(item) for item in response.get("output", []) if isinstance(item, Mapping))
+        has_training_tokens = any(loss_mask)
+        return cls(
+            task_id=task_id,
+            sample_id=sample_id,
+            input_ids=input_ids if has_training_tokens else None,
+            loss_mask=loss_mask if has_training_tokens else None,
+            logprobs=logprobs if has_training_tokens else None,
+            reward=reward,
+            metrics=dict(metrics or {}),
+            metadata=dict(metadata or {}),
+            messages=semantic_messages,
+            steps=steps,
+        )
 
     @classmethod
     def from_model_output(

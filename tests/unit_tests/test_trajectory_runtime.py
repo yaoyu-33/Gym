@@ -76,3 +76,37 @@ def test_unauthenticated_client_uses_mutable_empty_headers():
     client = OpenAIModelClient("http://localhost:8000/v1", "model")
 
     assert client._headers == {}
+
+
+def test_responses_rollout_projects_multi_turn_training_tokens():
+    trajectory = Trajectory.from_responses(
+        task_id="task",
+        sample_id="task:0",
+        messages=[{"role": "user", "content": "2 + 2?"}],
+        response={
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "calculator",
+                    "prompt_token_ids": [10, 11],
+                    "generation_token_ids": [12],
+                    "generation_log_probs": [-0.1],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "4",
+                    "prompt_token_ids": [10, 11, 12, 13],
+                    "generation_token_ids": [14, 15],
+                    "generation_log_probs": [-0.2, -0.3],
+                },
+            ]
+        },
+        reward=1.0,
+    )
+
+    assert trajectory.schema_version == 1
+    assert trajectory.input_ids == [10, 11, 12, 13, 14, 15]
+    assert trajectory.loss_mask == [0, 0, 1, 0, 1, 1]
+    assert trajectory.logprobs == [0.0, 0.0, -0.1, 0.0, -0.2, -0.3]
+    assert [step["generation_span"] for step in trajectory.steps] == [[2, 3], [4, 6]]

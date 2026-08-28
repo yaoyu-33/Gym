@@ -17,7 +17,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 if TYPE_CHECKING:
@@ -34,6 +34,7 @@ from nemo_gym.openai_utils import (
 from nemo_gym.reward_profile import AggregateMetricsMixin, compute_aggregate_metrics
 from nemo_gym.rollout_correlation import RolloutContextMiddleware
 from nemo_gym.server_utils import BaseRunServerInstanceConfig, BaseServer, SimpleServer
+from nemo_gym.trajectory_runtime import Trajectory
 
 
 NEMO_GYM_MCP_SESSION_TOKEN_HEADER = "X-NeMo-Gym-Session-Token"
@@ -87,6 +88,12 @@ class BaseResourcesServer(BaseServer):
 
 class BaseRunRequest(BaseModel):
     responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+    gym_trajectory_version: Optional[int] = Field(
+        default=None,
+        alias="_ng_trajectory_version",
+        exclude=True,
+        description="Internal negotiation field for a serialized Gym Trajectory response.",
+    )
 
 
 class BaseVerifyRequest(BaseRunRequest):
@@ -95,6 +102,7 @@ class BaseVerifyRequest(BaseRunRequest):
 
 class BaseVerifyResponse(BaseVerifyRequest):
     reward: float
+    trajectory: Optional[Trajectory] = None
 
     # Human-readable diagnosis of why `reward` may not reflect policy quality.
     # Machine-readable handling belongs to `mask_sample`/`failure_kind`.
