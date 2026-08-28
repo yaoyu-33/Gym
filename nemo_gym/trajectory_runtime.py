@@ -28,8 +28,6 @@ from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from nemo_gym.server_utils import get_response_json, raise_for_status, request
-
 
 Messages = Sequence[Mapping[str, Any]]
 SamplingParams = Mapping[str, Any]
@@ -97,6 +95,9 @@ class OpenAIModelClient:
         return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
 
     async def _vllm_prompt_token_ids(self, messages: Messages) -> list[int]:
+        # Keep the HTTP/server stack optional until the concrete endpoint client is used.
+        from nemo_gym.server_utils import get_response_json, raise_for_status, request
+
         api_root = self._base_url.removesuffix("/v1")
         response = await request(
             method="POST",
@@ -129,6 +130,9 @@ class OpenAIModelClient:
         messages: Messages,
         sampling_params: SamplingParams | None = None,
     ) -> ModelOutput:
+        # Keep the HTTP/server stack optional until the concrete endpoint client is used.
+        from nemo_gym.server_utils import get_response_json, raise_for_status, request
+
         sampling = dict(sampling_params or {})
         reserved = {"messages", "model", "stream"}.intersection(sampling)
         if reserved:
