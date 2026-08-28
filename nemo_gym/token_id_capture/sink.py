@@ -55,8 +55,8 @@ class CaptureContext:
     The context identifies the rollout and model call.
     ``token_sink`` receives the resulting record.
     A framework may provide any ``TokenSink`` implementation.
-    Every consumer shares the same per-call decision.
-    This keeps lineage, prefix supply, and capture metadata consistent.
+    Parent resolution runs once for each call.
+    Prefix supply and token capture read the same immutable decision.
     """
 
     rollout_id: str
@@ -136,8 +136,8 @@ async def resolve_parent(request_messages: list | None) -> None:
     Resolve once before dialect conversion or dispatch.
     Prefix supply and capture then share one parent decision.
     Return without work for untagged traffic.
-    Every attempted resolution records a decision.
-    A miss records its unresolved reason.
+    Every attempted resolution records a root, resolved, or unresolved decision.
+    An unresolved decision includes its reason.
     """
     context = _CAPTURE_CONTEXT.get()
     if context is None or request_messages is None:
@@ -172,13 +172,13 @@ async def resolve_parent(request_messages: list | None) -> None:
 
 
 async def register_call_intent() -> None:
-    """Durably record, before dispatch, that this captured call is about to happen.
+    """Record durable call intent before dispatch starts generation.
 
     ``begin_call`` is an optional sink extension.
     A dangling intent identifies a lost entry.
     Failure happens before generation and propagates to the caller.
     The harness can retry without spending inference compute.
-    Sinks without ``begin_call`` keep the previous behavior.
+    Sinks without ``begin_call`` cannot report a missing final entry this way.
     """
     context = _CAPTURE_CONTEXT.get()
     if context is None or context.token_sink is None:

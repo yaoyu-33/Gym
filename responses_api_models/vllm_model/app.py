@@ -650,16 +650,16 @@ class VLLMModel(SimpleResponsesAPIModel):
     _prefix_supply_lock: Any = PrivateAttr(default_factory=Lock)
 
     def _apply_prefix_supply(self, body_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Request that the engine extend a verified parent's exact tokens.
+        """Add a verified parent's exact tokens to a compatible engine request.
 
         Prefix supply is opt-in.
-        A unique verified parent provides the cumulative prefix.
-        The backend must implement the required_prefix_token_ids extension.
+        A unique parent match provides the cumulative token prefix.
+        The backend must implement the ``required_prefix_token_ids`` extension.
         Stock vLLM does not implement this extension.
-        The request records intent through prefix_requested.
-        Only generation-time prompt_token_ids can prove application through prefix_supplied.
+        ``prefix_requested`` records that the request included the prefix.
+        Only generation-time ``prompt_token_ids`` can prove that the backend applied it.
+        That proof sets ``prefix_supplied``.
         A missing or ambiguous parent leaves the request unchanged.
-        This fallback avoids supplying tokens from the wrong conversation.
         """
         if not self.config.supply_prefix_token_ids:
             return body_dict
@@ -685,9 +685,10 @@ class VLLMModel(SimpleResponsesAPIModel):
 
     @staticmethod
     def _generation_prompt_token_ids(response: dict) -> Any:
-        """Find generation-time prompt token ids, mirroring the token-metadata source order.
+        """Return the prompt token IDs reported by generation.
 
-        A message-level bundle outranks top-level transport fields.
+        Prefer the message-level token bundle over top-level transport fields.
+        Token capture uses the same source order.
         """
         choices = response.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}

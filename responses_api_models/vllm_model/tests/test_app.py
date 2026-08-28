@@ -5345,7 +5345,7 @@ class TestPrefixSupply:
         assert "required_prefix_token_ids" not in out
 
     def test_a_fork_gets_the_parents_prefix_not_the_previous_calls(self, monkeypatch: MonkeyPatch, tmp_path) -> None:
-        """Two sub-agents branching from one parent must both get cum(parent).
+        """Give each branch the verified parent's cumulative tokens.
 
         A running cursor would include the first branch's generation in the second branch.
         The backend would then generate from a conversation that never happened.
@@ -5397,11 +5397,11 @@ class TestPrefixSupply:
 
 
 class TestPrefixSupplyAccounting:
-    """Supply must be auditable after the fact.
+    """Distinguish requested prefixes from prefixes proven to be applied.
 
     Contiguous chains do not prove that supply fired.
-    prefix_requested records intent only.
-    prefix_supplied records generation-time proof.
+    ``prefix_requested`` records intent only.
+    ``prefix_supplied`` records generation-time proof.
     A lock protects the diagnostic counters.
     """
 
@@ -5460,9 +5460,9 @@ class TestPrefixSupplyAccounting:
 class TestPrefixSupplyReachesTokenize:
     """Require generation-time proof for supplied prefixes.
 
-    The generation request carries required_prefix_token_ids.
+    The generation request carries ``required_prefix_token_ids``.
     A supplied request skips the separate tokenize call.
-    The generation response must return the actual prompt_token_ids.
+    The generation response must return the actual ``prompt_token_ids``.
     Those token IDs prove whether the backend applied the requested prefix.
     """
 
@@ -5682,7 +5682,7 @@ class TestPrefixSupplyReachesTokenize:
 
 
 class TestPrefixSupplyUsesTheRequestAsReceived:
-    """Supply consumes a parent resolved before the request was dispatched.
+    """Resolve the parent before request conversion or preprocessing.
 
     Responses-to-Chat conversion and preprocessing can reshape the request body.
     The lineage index records the request as received.
@@ -5723,10 +5723,10 @@ class TestPrefixSupplyUsesTheRequestAsReceived:
 
 
 class TestGenerationProofAcceptsBundleShape:
-    """Generation-time proof mirrors the token-metadata source order.
+    """Read generation-time prompt tokens from every supported response shape.
 
-    A backend can return prompt token ids as a message-level bundle instead of transport fields.
-    The proof must read the same sources in the same priority order.
+    A backend can return prompt token IDs in a message-level bundle or a top-level transport field.
+    Prefix verification uses the same priority order as token capture.
     """
 
     def test_a_backend_returning_a_message_bundle_passes_verification(self, tmp_path) -> None:
