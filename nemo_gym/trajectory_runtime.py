@@ -91,8 +91,8 @@ class OpenAIModelClient:
         self._vllm_token_ids = vllm_token_ids
 
     @property
-    def _headers(self) -> dict[str, str] | None:
-        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
 
     async def _vllm_prompt_token_ids(self, messages: Messages) -> list[int]:
         # Keep the HTTP/server stack optional until the concrete endpoint client is used.
@@ -291,5 +291,11 @@ class TrajectoryRunner:
             for sample_index in range(n):
                 sample_id = f"{task_id}:{sample_index}"
                 pending.append(asyncio.create_task(self._run_one(task, model, sample_id, sampling)))
-        for future in asyncio.as_completed(pending):
-            yield await future
+        try:
+            for future in asyncio.as_completed(pending):
+                yield await future
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)

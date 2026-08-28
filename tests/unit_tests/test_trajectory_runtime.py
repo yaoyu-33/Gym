@@ -70,3 +70,9 @@ def test_vllm_token_id_logprobs_are_projected_without_retokenizing():
 
     assert token_ids == [12, 13]
     assert logprobs == [-0.1, -0.2]
+
+
+def test_unauthenticated_client_uses_mutable_empty_headers():
+    client = OpenAIModelClient("http://localhost:8000/v1", "model")
+
+    assert client._headers == {}
