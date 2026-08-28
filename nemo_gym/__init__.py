@@ -205,12 +205,8 @@ _LAZY_EXPORTS: dict[str, str] = {
     "NeMoGymResponseCreateParamsNonStreaming": "openai_utils",
     "NeMoGymChatCompletion": "openai_utils",
     "NeMoGymChatCompletionCreateParamsNonStreaming": "openai_utils",
-    # Framework-neutral trajectory runtime boundary
-    "ModelClient": "trajectory_runtime",
-    "ModelOutput": "trajectory_runtime",
-    "OpenAIModelClient": "trajectory_runtime",
+    # Training trajectory returned by agent /run.
     "Trajectory": "trajectory_runtime",
-    "TrajectoryRunner": "trajectory_runtime",
 }
 
 # Eagerly-defined names (path constants + package metadata) that live directly in this module.

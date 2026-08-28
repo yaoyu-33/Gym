@@ -1,101 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
-
 import pytest
 from pydantic import ValidationError
 
-from nemo_gym.trajectory_runtime import ModelOutput, OpenAIModelClient, Trajectory, TrajectoryRunner
-
-
-class FakeModelClient:
-    async def generate(self, messages, sampling_params=None):
-        delay = float(messages[0]["content"])
-        await asyncio.sleep(delay)
-        return ModelOutput(
-            message={"role": "assistant", "content": "4"},
-            prompt_token_ids=[10, 11],
-            generation_token_ids=[12],
-            generation_logprobs=[-0.25],
-        )
-
-
-async def exact_match_executor(task, model, sample_id, sampling):
-    output = await model.generate(task["messages"], sampling)
-    reward = float(output.message["content"] == task["expected_answer"])
-    return Trajectory.from_model_output(
-        task_id=task["task_id"],
-        sample_id=sample_id,
-        messages=task["messages"],
-        output=output,
-        reward=reward,
-    )
-
-
-@pytest.mark.asyncio
-async def test_runner_streams_training_ready_trajectories_as_completed():
-    runner = TrajectoryRunner(exact_match_executor)
-    tasks = [
-        {"task_id": "slow", "messages": [{"role": "user", "content": "0.02"}], "expected_answer": "4"},
-        {"task_id": "fast", "messages": [{"role": "user", "content": "0"}], "expected_answer": "4"},
-    ]
-
-    trajectories = [trajectory async for trajectory in runner.run(tasks, model=FakeModelClient(), n=2)]
-
-    assert trajectories[0].task_id == "fast"
-    assert {trajectory.sample_id for trajectory in trajectories} == {"slow:0", "slow:1", "fast:0", "fast:1"}
-    assert all(trajectory.input_ids == [10, 11, 12] for trajectory in trajectories)
-    assert all(trajectory.loss_mask == [0, 0, 1] for trajectory in trajectories)
-    assert all(trajectory.logprobs == [0.0, 0.0, -0.25] for trajectory in trajectories)
-    assert all(trajectory.reward == 1.0 for trajectory in trajectories)
+from nemo_gym.trajectory_runtime import Trajectory
 
 
 def test_trajectory_rejects_misaligned_training_fields():
-    with pytest.raises(ValidationError, match="loss_mask must be present and aligned"):
-        Trajectory(task_id="task", sample_id="task:0", input_ids=[1, 2], loss_mask=[1])
-
-
-def test_vllm_token_id_logprobs_are_projected_without_retokenizing():
-    token_ids, logprobs = OpenAIModelClient._vllm_generation_data(
-        {
-            "logprobs": {
-                "content": [
-                    {"token": "token_id:12", "logprob": -0.1},
-                    {"token": "token_id:13", "logprob": -0.2},
-                ]
-            }
-        }
-    )
-
-    assert token_ids == [12, 13]
-    assert logprobs == [-0.1, -0.2]
-
-
-def test_unauthenticated_client_uses_mutable_empty_headers():
-    client = OpenAIModelClient("http://localhost:8000/v1", "model")
-
-    assert client._headers == {}
+    with pytest.raises(ValidationError, match="loss_mask must align"):
+        Trajectory(input_ids=[1, 2], loss_mask=[1], logprobs=[0.0, -0.1], reward=1.0)
 
 
 def test_responses_rollout_projects_multi_turn_training_tokens():
     trajectory = Trajectory.from_responses(
-        task_id="task",
-        sample_id="task:0",
-        messages=[{"role": "user", "content": "2 + 2?"}],
         response={
             "output": [
                 {
-                    "type": "function_call",
-                    "name": "calculator",
                     "prompt_token_ids": [10, 11],
                     "generation_token_ids": [12],
                     "generation_log_probs": [-0.1],
                 },
                 {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": "4",
                     "prompt_token_ids": [10, 11, 12, 13],
                     "generation_token_ids": [14, 15],
                     "generation_log_probs": [-0.2, -0.3],
@@ -105,8 +31,6 @@ def test_responses_rollout_projects_multi_turn_training_tokens():
         reward=1.0,
     )
 
-    assert trajectory.schema_version == 1
     assert trajectory.input_ids == [10, 11, 12, 13, 14, 15]
     assert trajectory.loss_mask == [0, 0, 1, 0, 1, 1]
     assert trajectory.logprobs == [0.0, 0.0, -0.1, 0.0, -0.2, -0.3]
-    assert [step["generation_span"] for step in trajectory.steps] == [[2, 3], [4, 6]]

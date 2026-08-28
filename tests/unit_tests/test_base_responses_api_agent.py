@@ -108,10 +108,9 @@ class TestBaseResponsesAPIAgent:
         # Agent opt-in alone does not enable capture.
         assert self._agent({}, token_id_capture=True).rollout_id_from_run(body) is None
 
-    def test_requested_trajectory_is_attached_to_run_result(self) -> None:
+    def test_trajectory_is_attached_to_run_result(self) -> None:
         body = BaseRunRequest.model_validate(
             {
-                "_ng_trajectory_version": 1,
                 "responses_create_params": {
                     "input": [{"role": "user", "content": "2 + 2?"}],
                     "metadata": {"task_id": "arithmetic"},
@@ -137,10 +136,8 @@ class TestBaseResponsesAPIAgent:
             reward=1.0,
         )
 
-        attached = self._agent({})._attach_requested_trajectory(body, result)
+        attached = self._agent({})._attach_trajectory(result)
 
         assert attached.trajectory is not None
-        assert attached.trajectory.task_id == "arithmetic"
         assert attached.trajectory.input_ids == [10, 11, 12]
         assert attached.trajectory.loss_mask == [0, 0, 1]
-        assert "_ng_trajectory_version" not in body.model_dump(by_alias=True)

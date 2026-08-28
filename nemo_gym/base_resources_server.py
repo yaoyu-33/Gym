@@ -17,7 +17,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 if TYPE_CHECKING:
@@ -88,12 +88,6 @@ class BaseResourcesServer(BaseServer):
 
 class BaseRunRequest(BaseModel):
     responses_create_params: NeMoGymResponseCreateParamsNonStreaming
-    gym_trajectory_version: Optional[int] = Field(
-        default=None,
-        alias="_ng_trajectory_version",
-        exclude=True,
-        description="Internal negotiation field for a serialized Gym Trajectory response.",
-    )
 
 
 class BaseVerifyRequest(BaseRunRequest):
@@ -102,6 +96,7 @@ class BaseVerifyRequest(BaseRunRequest):
 
 class BaseVerifyResponse(BaseVerifyRequest):
     reward: float
+    # Filled by SimpleResponsesAPIAgent after the agent and verifier finish.
     trajectory: Optional[Trajectory] = None
 
     # Human-readable diagnosis of why `reward` may not reflect policy quality.

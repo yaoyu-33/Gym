@@ -45,7 +45,7 @@ from nemo_gym.server_utils import (
     apply_rollout_prefix,
     rollout_path_prefix,
 )
-from nemo_gym.trajectory_runtime import TRAJECTORY_SCHEMA_VERSION, Trajectory
+from nemo_gym.trajectory_runtime import Trajectory
 
 
 class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
@@ -87,55 +87,21 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
                 body = next((arg for arg in args if isinstance(arg, BaseRunRequest)), None)
             with rollout_context(self.rollout_id_from_run(body)):
                 result = await run(*args, **kwargs)
-            return self._attach_requested_trajectory(body, result)
+            return self._attach_trajectory(result)
 
         app.post("/run")(run_with_rollout_context)
         app.post("/aggregate_metrics")(self.aggregate_metrics)
 
         return app
 
-    def _attach_requested_trajectory(
-        self,
-        body: BaseRunRequest | None,
-        result: BaseVerifyResponse,
-    ) -> BaseVerifyResponse:
-        """Attach the negotiated Gym trajectory without changing legacy callers."""
-        if body is None or body.gym_trajectory_version is None:
-            return result
-        if body.gym_trajectory_version != TRAJECTORY_SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported requested trajectory version {body.gym_trajectory_version}; "
-                f"expected {TRAJECTORY_SCHEMA_VERSION}"
-            )
-        if result.trajectory is not None:
-            return result
-
+    @staticmethod
+    def _attach_trajectory(result: BaseVerifyResponse) -> BaseVerifyResponse:
+        """Attach the training trajectory to every successful agent run."""
         result_payload = result.model_dump(mode="python")
-        request_payload = body.model_dump(mode="python", by_alias=True)
-        responses_create_params = result_payload["responses_create_params"]
-        request_metadata = responses_create_params.get("metadata") or {}
-        task_identity = request_payload.get("_ng_task_index")
-        if task_identity is None:
-            task_identity = request_metadata.get("task_id")
-        if task_identity is None:
-            task_identity = request_metadata.get("instance_id", "task")
-        task_id = str(task_identity)
-        rollout_index = request_payload.get("_rowidx", request_payload.get("_ng_rollout_index", 0))
-        response = result_payload["response"]
         trajectory = Trajectory.from_responses(
-            task_id=task_id,
-            sample_id=f"{task_id}:{rollout_index}",
-            messages=(
-                responses_create_params["input"]
-                if isinstance(responses_create_params["input"], list)
-                else [{"role": "user", "content": responses_create_params["input"]}]
-            ),
-            response=response,
+            response=result_payload["response"],
             reward=float(result.reward),
-            metadata={"response_id": response.get("id")},
         )
-        if trajectory.input_ids is None:
-            return result
         return result.model_copy(update={"trajectory": trajectory})
 
     def _capture_correlation_enabled(self) -> bool:
