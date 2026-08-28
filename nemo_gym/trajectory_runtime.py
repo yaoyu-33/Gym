@@ -1,0 +1,240 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Framework-neutral primitives for streaming training trajectories.
+
+This module is intentionally independent of any RL algorithm or training
+framework. A loaded Gym environment supplies the ``TrajectoryExecutor`` that
+owns its agent/environment/evaluator loop; the caller supplies a ``ModelClient``
+whose lifecycle remains owned by the RL framework.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import Any, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from nemo_gym.server_utils import get_response_json, raise_for_status, request
+
+
+Messages = Sequence[Mapping[str, Any]]
+SamplingParams = Mapping[str, Any]
+
+
+class ModelOutput(BaseModel):
+    """One model turn, including exact server-side training token data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: dict[str, Any]
+    prompt_token_ids: list[int] | None = None
+    generation_token_ids: list[int] | None = None
+    generation_logprobs: list[float] | None = None
+    raw_response: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_generation_arrays(self) -> "ModelOutput":
+        if self.generation_logprobs is not None:
+            if self.generation_token_ids is None:
+                raise ValueError("generation_token_ids are required when generation_logprobs are present")
+            if len(self.generation_logprobs) != len(self.generation_token_ids):
+                raise ValueError("generation_token_ids and generation_logprobs must have equal lengths")
+        return self
+
+
+class ModelClient(Protocol):
+    """Inference boundary implemented by an RL framework or endpoint adapter."""
+
+    async def generate(
+        self,
+        messages: Messages,
+        sampling_params: SamplingParams | None = None,
+    ) -> ModelOutput: ...
+
+
+class OpenAIModelClient:
+    """Model client for an OpenAI-compatible Chat Completions endpoint.
+
+    Standard Chat Completions fields are sufficient for semantic trajectories.
+    Training-ready trajectories additionally require the endpoint to return
+    ``prompt_token_ids``, ``generation_token_ids``, and
+    ``generation_log_probs`` on ``choices[0].message``. NeMo-RL's exposed vLLM
+    endpoint implements this extension so Gym does not need to re-tokenize a
+    response and risk training/inference token drift.
+    """
+
+    def __init__(self, base_url: str, model: str, api_key: str | None = None) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._model = model
+        self._api_key = api_key
+
+    async def generate(
+        self,
+        messages: Messages,
+        sampling_params: SamplingParams | None = None,
+    ) -> ModelOutput:
+        sampling = dict(sampling_params or {})
+        reserved = {"messages", "model", "stream"}.intersection(sampling)
+        if reserved:
+            raise ValueError(f"sampling_params may not override: {', '.join(sorted(reserved))}")
+        payload = {
+            "model": self._model,
+            "messages": [dict(message) for message in messages],
+            "stream": False,
+            "logprobs": True,
+            **sampling,
+        }
+        headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+        response = await request(
+            method="POST",
+            url=f"{self._base_url}/chat/completions",
+            json=payload,
+            headers=headers,
+        )
+        await raise_for_status(response)
+        response_body = await get_response_json(response)
+        try:
+            message = dict(response_body["choices"][0]["message"])
+        except (IndexError, KeyError, TypeError) as exc:
+            raise ValueError("Chat Completions response has no choices[0].message") from exc
+        return ModelOutput(
+            message=message,
+            prompt_token_ids=message.pop("prompt_token_ids", None),
+            generation_token_ids=message.pop("generation_token_ids", None),
+            generation_logprobs=message.pop("generation_log_probs", None),
+            raw_response=response_body,
+        )
+
+
+class Trajectory(BaseModel):
+    """Framework-neutral result of one task/sample rollout.
+
+    Token-aligned fields either all use the length of ``input_ids`` or are
+    absent. Logprobs at masked prompt/environment positions are conventionally
+    zero; ``loss_mask`` is authoritative.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    task_id: str
+    sample_id: str
+    input_ids: list[int] | None = None
+    loss_mask: list[int] | None = None
+    logprobs: list[float] | None = None
+    reward: float | None = None
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_training_arrays(self) -> "Trajectory":
+        if self.input_ids is None:
+            if self.loss_mask is not None or self.logprobs is not None:
+                raise ValueError("loss_mask and logprobs require input_ids")
+            return self
+        if self.loss_mask is None or len(self.loss_mask) != len(self.input_ids):
+            raise ValueError("loss_mask must be present and aligned with input_ids")
+        if any(value not in (0, 1) for value in self.loss_mask):
+            raise ValueError("loss_mask values must be 0 or 1")
+        if self.logprobs is not None and len(self.logprobs) != len(self.input_ids):
+            raise ValueError("logprobs must be aligned with input_ids")
+        return self
+
+    @classmethod
+    def from_model_output(
+        cls,
+        *,
+        task_id: str,
+        sample_id: str,
+        messages: Messages,
+        output: ModelOutput,
+        reward: float | None = None,
+        metrics: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "Trajectory":
+        """Build a one-turn trajectory without re-tokenizing model output."""
+        input_ids = None
+        loss_mask = None
+        logprobs = None
+        if output.prompt_token_ids is not None and output.generation_token_ids is not None:
+            input_ids = output.prompt_token_ids + output.generation_token_ids
+            loss_mask = [0] * len(output.prompt_token_ids) + [1] * len(output.generation_token_ids)
+            if output.generation_logprobs is not None:
+                logprobs = [0.0] * len(output.prompt_token_ids) + output.generation_logprobs
+        semantic_messages = [dict(message) for message in messages]
+        semantic_messages.append(output.message)
+        return cls(
+            task_id=task_id,
+            sample_id=sample_id,
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+            logprobs=logprobs,
+            reward=reward,
+            metrics=dict(metrics or {}),
+            metadata=dict(metadata or {}),
+            messages=semantic_messages,
+            steps=[{"type": "model", "output": output.message}],
+        )
+
+
+TrajectoryExecutor = Callable[
+    [Mapping[str, Any], ModelClient, str, SamplingParams | None],
+    Awaitable[Trajectory],
+]
+
+
+class TrajectoryRunner:
+    """Run a Gym-owned loop and stream trajectories in completion order."""
+
+    def __init__(self, executor: TrajectoryExecutor, *, max_concurrency: int | None = None) -> None:
+        if max_concurrency is not None and max_concurrency < 1:
+            raise ValueError("max_concurrency must be positive")
+        self._executor = executor
+        self._semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency is not None else None
+
+    async def _run_one(
+        self,
+        task: Mapping[str, Any],
+        model: ModelClient,
+        sample_id: str,
+        sampling: SamplingParams | None,
+    ) -> Trajectory:
+        if self._semaphore is None:
+            return await self._executor(task, model, sample_id, sampling)
+        async with self._semaphore:
+            return await self._executor(task, model, sample_id, sampling)
+
+    async def run(
+        self,
+        tasks: Iterable[Mapping[str, Any]],
+        *,
+        model: ModelClient,
+        n: int = 1,
+        sampling: SamplingParams | None = None,
+    ) -> AsyncIterator[Trajectory]:
+        """Yield task/sample rollouts as each finishes."""
+        if n < 1:
+            raise ValueError("n must be positive")
+        pending = []
+        for task_index, task in enumerate(tasks):
+            task_id = str(task.get("task_id", task_index))
+            for sample_index in range(n):
+                sample_id = f"{task_id}:{sample_index}"
+                pending.append(asyncio.create_task(self._run_one(task, model, sample_id, sampling)))
+        for future in asyncio.as_completed(pending):
+            yield await future
