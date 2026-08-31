@@ -50,7 +50,7 @@ from nemo_gym.rollout_observability import (
     TrajectoryToolCall,
     TrajectoryTurn,
 )
-from nemo_gym.server_utils import get_response_json, raise_for_status
+from nemo_gym.server_utils import RUNTIME_POLICY_BASE_URL_HEADER, get_response_json, raise_for_status
 
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
@@ -86,6 +86,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         task_id: str = "unscoped",
         rollout_id: str = "unscoped",
         collect_trajectory: bool = False,
+        model_server_headers: dict[str, str] | None = None,
     ) -> tuple[NeMoGymResponse, TrajectoryRecord | None, Any, Any]:
         invocation_id = "root"
         tool_records: list[TrajectoryToolCall] = []
@@ -114,6 +115,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 url_path=model_url_path,
                 json=new_body,
                 cookies=model_server_cookies,
+                headers=model_server_headers,
             )
             # We raise for status here since we expect model calls to always work.
             await raise_for_status(model_response)
@@ -258,12 +260,19 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         path_params = getattr(request, "path_params", None)
         rollout_id = path_params.get("rollout_id") if isinstance(path_params, Mapping) else None
         collect_trajectory = self._model_call_capture_enabled() and isinstance(rollout_id, str)
+        model_server_headers = None
+        request_headers = getattr(request, "headers", None)
+        if isinstance(request_headers, Mapping) and (
+            runtime_policy_base_url := request_headers.get(RUNTIME_POLICY_BASE_URL_HEADER)
+        ):
+            model_server_headers = {RUNTIME_POLICY_BASE_URL_HEADER: runtime_policy_base_url}
         model_response, trajectory, model_server_cookies, resources_server_cookies = await self._create_episode(
             body,
             model_url_path=self.url_path_for_request("/v1/responses", request),
             resources_server_cookies=request.cookies,
             rollout_id=rollout_id or "unscoped",
             collect_trajectory=collect_trajectory,
+            model_server_headers=model_server_headers,
         )
         # Propogate any extra cookies necessary for downstream verification
         for k, v in (*resources_server_cookies.items(), *model_server_cookies.items()):
@@ -286,11 +295,16 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         await raise_for_status(seed_session_response)
         cookies = seed_session_response.cookies
 
+        model_extra = body.model_extra or {}
+        runtime_policy_base_url = model_extra.get("policy_base_url")
+        if runtime_policy_base_url is not None and not isinstance(runtime_policy_base_url, str):
+            raise ValueError("policy_base_url must be a string")
         response = await self.server_client.post(
             server_name=self.config.name,
             url_path=self.url_path_for_run("/v1/responses", body),
             json=body.responses_create_params,
             cookies=cookies,
+            headers=({RUNTIME_POLICY_BASE_URL_HEADER: runtime_policy_base_url} if runtime_policy_base_url else None),
         )
         await raise_for_status(response)
         model_response_json = await get_response_json(response)

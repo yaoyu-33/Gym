@@ -57,6 +57,7 @@ EXPECTED_LAZY_EXPORTS = {
     "SimpleResourcesServer",
     "SimpleResponsesAPIAgent",
     "SimpleResponsesAPIModel",
+    "Trajectory",
     "get_response_json",
     "raise_for_status",
 }

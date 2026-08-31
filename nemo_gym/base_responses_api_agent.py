@@ -45,6 +45,7 @@ from nemo_gym.server_utils import (
     apply_rollout_prefix,
     rollout_path_prefix,
 )
+from nemo_gym.trajectory_runtime import Trajectory
 
 
 class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
@@ -85,12 +86,23 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
             if body is None:
                 body = next((arg for arg in args if isinstance(arg, BaseRunRequest)), None)
             with rollout_context(self.rollout_id_from_run(body)):
-                return await run(*args, **kwargs)
+                result = await run(*args, **kwargs)
+            return self._attach_trajectory(result)
 
         app.post("/run")(run_with_rollout_context)
         app.post("/aggregate_metrics")(self.aggregate_metrics)
 
         return app
+
+    @staticmethod
+    def _attach_trajectory(result: BaseVerifyResponse) -> BaseVerifyResponse:
+        """Attach the training trajectory to every successful agent run."""
+        result_payload = result.model_dump(mode="python")
+        trajectory = Trajectory.from_responses(
+            response=result_payload["response"],
+            reward=float(result.reward),
+        )
+        return result.model_copy(update={"trajectory": trajectory})
 
     def _capture_correlation_enabled(self) -> bool:
         """Return whether this agent needs rollout correlation.

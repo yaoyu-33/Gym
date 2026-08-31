@@ -34,6 +34,7 @@ from nemo_gym.openai_utils import (
 from nemo_gym.reward_profile import AggregateMetricsMixin, compute_aggregate_metrics
 from nemo_gym.rollout_correlation import RolloutContextMiddleware
 from nemo_gym.server_utils import BaseRunServerInstanceConfig, BaseServer, SimpleServer
+from nemo_gym.trajectory_runtime import Trajectory
 
 
 NEMO_GYM_MCP_SESSION_TOKEN_HEADER = "X-NeMo-Gym-Session-Token"
@@ -95,6 +96,8 @@ class BaseVerifyRequest(BaseRunRequest):
 
 class BaseVerifyResponse(BaseVerifyRequest):
     reward: float
+    # Filled by SimpleResponsesAPIAgent after the agent and verifier finish.
+    trajectory: Optional[Trajectory] = None
 
     # Human-readable diagnosis of why `reward` may not reflect policy quality.
     # Machine-readable handling belongs to `mask_sample`/`failure_kind`.

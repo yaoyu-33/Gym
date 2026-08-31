@@ -32,7 +32,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.rollout_collection import _attach_trajectory_record
 from nemo_gym.rollout_observability import TrajectoryRecord
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.server_utils import RUNTIME_POLICY_BASE_URL_HEADER, ServerClient
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
     ResourcesServerRef,
@@ -96,6 +96,40 @@ class TestApp:
             ),
         )
         SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+
+    async def test_run_forwards_per_run_policy_base_url_to_self_dispatch(self) -> None:
+        server, server_client = _make_agent(False)
+        model_response = {
+            "id": "response-1",
+            "created_at": 1.0,
+            "model": "model",
+            "object": "response",
+            "output": [],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        }
+
+        async def post(*, url_path, **kwargs):
+            if url_path == "/seed_session":
+                return _mock_response()
+            if url_path == "/v1/responses":
+                assert kwargs["headers"] == {RUNTIME_POLICY_BASE_URL_HEADER: "http://rollout-engine:8000/v1"}
+                return _mock_response(model_response)
+            assert url_path == "/verify"
+            return _mock_response(kwargs["json"] | {"reward": 1.0})
+
+        server_client.post = AsyncMock(side_effect=post)
+        body = SimpleAgentRunRequest.model_validate(
+            {
+                "responses_create_params": {"input": "question"},
+                "policy_base_url": "http://rollout-engine:8000/v1",
+            }
+        )
+
+        result = await server.run(MagicMock(cookies={}), body)
+
+        assert result.reward == 1.0
 
     async def test_responses(self, monkeypatch: MonkeyPatch) -> None:
         config = SimpleAgentConfig(
