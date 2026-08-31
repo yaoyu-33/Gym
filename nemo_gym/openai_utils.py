@@ -733,6 +733,9 @@ NeMoGymResponseOutputItem = Annotated[
 
 class NeMoGymResponseInputTokensDetails(ResponseInputTokensDetails):
     cached_tokens: Optional[int]
+    # Newer OpenAI SDKs make this provider-specific field required. Keep it
+    # optional so providers that only report cache reads remain compatible.
+    cache_write_tokens: Optional[int] = None
 
 
 class NeMoGymResponseOutputTokensDetails(ResponseOutputTokensDetails):

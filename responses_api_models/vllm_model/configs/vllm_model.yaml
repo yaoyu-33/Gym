@@ -16,3 +16,4 @@ policy_model:
       endpoint_stale_grace_s: 300.0
       endpoint_connection_retries: 8
       endpoint_check_interval_s: 10.0
+      allow_runtime_base_url: false

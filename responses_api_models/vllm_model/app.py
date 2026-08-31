@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Mapping
 from copy import deepcopy
 from time import monotonic, time, time_ns
 from typing import Any, ClassVar, Dict, List, Optional, Union
@@ -48,7 +49,7 @@ from nemo_gym.responses_converter import (
     VLLMConverterResponsesToChatCompletionsState,  # noqa: F401
     split_responses_input_output_items,  # noqa: F401
 )
-from nemo_gym.server_utils import SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
+from nemo_gym.server_utils import RUNTIME_POLICY_BASE_URL_HEADER, SESSION_ID_KEY, is_nemo_gym_fastapi_entrypoint
 
 
 LOG = logging.getLogger("nemo_gym.vllm_model")
@@ -206,6 +207,10 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
 
     # How often endpoint_file may be stat'd; otherwise the `os.stat` results is cached and reused.
     endpoint_check_interval_s: float = 10.0
+
+    # Permit an agent to select the rollout engine for an individual /run
+    # request. This is opt-in because the URL is supplied by the caller.
+    allow_runtime_base_url: bool = False
     # Optional prefix for resolving relative ``metadata.audio_path`` (or
     # entries in ``metadata.audio_paths``) against. Absolute paths are used
     # as-is. When unset, relative paths raise. Audio is always inlined as a
@@ -290,6 +295,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         ]
 
         self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
+        self._runtime_base_url_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
         self._endpoint_file_mtime: Optional[float] = None
         self._endpoint_missing_since: Optional[float] = None
         self._endpoint_last_check_at: Optional[float] = None
@@ -1362,6 +1368,27 @@ class VLLMModel(SimpleResponsesAPIModel):
             )
 
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
+        request_headers = getattr(request, "headers", None)
+        runtime_base_url = (
+            request_headers.get(RUNTIME_POLICY_BASE_URL_HEADER) if isinstance(request_headers, Mapping) else None
+        )
+        if runtime_base_url:
+            if not self.config.allow_runtime_base_url:
+                raise RuntimeError(
+                    "A per-run policy_base_url was supplied, but allow_runtime_base_url is disabled "
+                    f"for model server {self.config.name!r}"
+                )
+            client = self._runtime_base_url_to_client.get(runtime_base_url)
+            if client is None:
+                client = NeMoGymAsyncOpenAI(
+                    base_url=runtime_base_url,
+                    api_key=self.config.api_key,
+                    default_headers=self.config.default_headers,
+                    max_connection_retries=self.config.endpoint_connection_retries,
+                )
+                self._runtime_base_url_to_client[runtime_base_url] = client
+            return client
+
         self._maybe_rebind_endpoint()
         session_id = request.session[SESSION_ID_KEY]
         if session_id not in self._session_id_to_client:

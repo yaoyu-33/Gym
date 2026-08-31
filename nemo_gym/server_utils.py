@@ -317,6 +317,10 @@ async def get_response_json(response: ClientResponse) -> Any:
 
 DEFAULT_HEAD_SERVER_PORT = 11000
 
+# Internal hop used by agents that delegate generation to the rollout engine
+# supplied on an individual /run request.
+RUNTIME_POLICY_BASE_URL_HEADER = "x-nemo-gym-policy-base-url"
+
 ServerStatus = Union[Literal["success"], Literal["connection_error"], Literal["timeout"], Literal["unknown_error"]]
 
 

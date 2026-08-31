@@ -52,7 +52,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseReasoningItem,
     NeMoGymSummary,
 )
-from nemo_gym.server_utils import SESSION_ID_KEY, ServerClient
+from nemo_gym.server_utils import RUNTIME_POLICY_BASE_URL_HEADER, SESSION_ID_KEY, ServerClient
 from responses_api_models.vllm_model.app import (
     VLLMConverter,
     VLLMModel,
@@ -761,6 +761,21 @@ class TestApp:
             client_indices.append(next(i for i, client in enumerate(worker._clients) if client is selected_client))
 
         assert client_indices[0] == client_indices[1]
+
+    def test_runtime_base_url_routing_is_explicit_and_cached(self, monkeypatch: MonkeyPatch) -> None:
+        server = self._setup_server(monkeypatch)
+        request = MagicMock()
+        request.headers = {RUNTIME_POLICY_BASE_URL_HEADER: "http://rollout-engine:8000/v1"}
+
+        with raises(RuntimeError, match="allow_runtime_base_url is disabled"):
+            server._resolve_client(request)
+
+        server.config.allow_runtime_base_url = True
+        first = server._resolve_client(request)
+        second = server._resolve_client(request)
+
+        assert first is second
+        assert first.base_url == "http://rollout-engine:8000/v1"
 
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
