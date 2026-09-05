@@ -118,17 +118,35 @@ def make_server(
     return server, post
 
 
-def test_checked_in_example_matches_verify_request_contract() -> None:
-    example = json.loads((ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()[0])
+def test_checked_in_examples_match_verify_request_contract() -> None:
+    examples = [
+        json.loads(line)
+        for line in (ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    requests = [
+        JailbreakDetectionVerifyRequest.model_validate(
+            {**example, "response": make_response("I cannot help with that request.")}
+        )
+        for example in examples
+    ]
 
-    request = JailbreakDetectionVerifyRequest.model_validate(
-        {**example, "response": make_response("I cannot help with that request.")}
-    )
-
-    assert request.adversarial_prompt == request.responses_create_params.input[-1].content
-    assert request.response_policy_mapped == "hard_refusal_no_redirection"
-    assert request.agent_ref is not None
-    assert request.agent_ref["name"] == "jailbreak_hard_refusal_no_redirection"
+    assert len(requests) == 5
+    assert {request.attack_type for request in requests} == {
+        "DAN",
+        "educational_bypass",
+        "grandma_exploit",
+        "roleplay",
+        "security_training_bypass",
+    }
+    assert {request.response_policy_mapped for request in requests} == {
+        "hard_refusal_no_redirection",
+        "refusal_with_explanation",
+    }
+    for request in requests:
+        assert request.adversarial_prompt == request.responses_create_params.input[-1].content
+        assert request.agent_ref is not None
+        assert request.agent_ref["name"] == f"jailbreak_{request.response_policy_mapped}"
 
 
 @pytest.mark.parametrize(

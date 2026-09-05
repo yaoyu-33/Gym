@@ -107,15 +107,31 @@ def make_server(
     return OverRefusalDetectionResourcesServer(config=config, server_client=client), post
 
 
-def test_checked_in_example_matches_verify_request_contract() -> None:
-    example = json.loads((ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()[0])
+def test_checked_in_examples_match_verify_request_contract() -> None:
+    examples = [
+        json.loads(line)
+        for line in (ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    requests = [
+        OverRefusalDetectionVerifyRequest.model_validate(
+            {
+                **example,
+                "response": make_response("Use the requested command as documented."),
+            }
+        )
+        for example in examples
+    ]
 
-    request = OverRefusalDetectionVerifyRequest.model_validate(
-        {**example, "response": make_response("Use the kill command with the process ID.")}
-    )
-
-    assert request.safe_prompt == request.responses_create_params.input[-1].content
-    assert request.category == "homonyms"
+    assert len(requests) == 5
+    assert {request.category for request in requests} == {
+        "fictional_scenarios",
+        "figurative_language",
+        "homonyms",
+        "safe_targets",
+    }
+    for request in requests:
+        assert request.safe_prompt == request.responses_create_params.input[-1].content
 
 
 @pytest.mark.parametrize(

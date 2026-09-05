@@ -74,19 +74,34 @@ def make_server() -> MultiChallengeServer:
     return MultiChallengeServer(config=config, server_client=MagicMock(spec=ServerClient))
 
 
-def test_checked_in_example_matches_verify_request_contract() -> None:
-    example = yaml.safe_load((ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()[0])
+def test_checked_in_examples_match_verify_request_contract() -> None:
+    examples = [
+        yaml.safe_load(line)
+        for line in (ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    requests = [
+        MultiChallengeVerifyRequest.model_validate({**example, "response": make_response("Acknowledged.")})
+        for example in examples
+    ]
 
-    request = MultiChallengeVerifyRequest.model_validate(
-        {**example, "response": make_response("Alex, try a nut-free snack.")}
-    )
-
-    assert request.context
-    assert request.context.endswith(request.responses_create_params.input[-1].content)
-    assert request.rubric is not None
-    assert [item["pass_criteria"] for item in request.rubric] == ["YES", "YES"]
-    assert request.agent_ref is not None
-    assert request.agent_ref["name"] == "multichallenge_simple_agent"
+    assert len(requests) == 5
+    challenges = set()
+    for request in requests:
+        assert request.metadata is not None
+        challenges.add(request.metadata["challenge"])
+    assert challenges >= {
+        "Context Tracking",
+        "Memory Retention",
+        "Preference Update",
+    }
+    for request in requests:
+        assert request.context
+        assert request.context.endswith(request.responses_create_params.input[-1].content)
+        assert request.rubric is not None
+        assert all(item["pass_criteria"] == "YES" for item in request.rubric)
+        assert request.agent_ref is not None
+        assert request.agent_ref["name"] == "multichallenge_simple_agent"
 
 
 class TestMultiChallenge:
