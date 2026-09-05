@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -49,6 +50,9 @@ class FakeHTTPResponse:
 
     async def read(self) -> bytes:
         return json.dumps(self._payload).encode()
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_response(text: str) -> NeMoGymResponse:
@@ -101,6 +105,17 @@ def make_server(
     post = AsyncMock(side_effect=[FakeHTTPResponse(output) for output in judge_outputs])
     client.post = post
     return OverRefusalDetectionResourcesServer(config=config, server_client=client), post
+
+
+def test_checked_in_example_matches_verify_request_contract() -> None:
+    example = json.loads((ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+    request = OverRefusalDetectionVerifyRequest.model_validate(
+        {**example, "response": make_response("Use the kill command with the process ID.")}
+    )
+
+    assert request.safe_prompt == request.responses_create_params.input[-1].content
+    assert request.category == "homonyms"
 
 
 @pytest.mark.parametrize(

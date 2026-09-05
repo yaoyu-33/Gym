@@ -39,6 +39,9 @@ from resources_servers.multichallenge.app import (
 )
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def make_response(text: str) -> NeMoGymResponse:
     return NeMoGymResponse(
         id="response_id",
@@ -61,7 +64,7 @@ def make_response(text: str) -> NeMoGymResponse:
 
 
 def make_server() -> MultiChallengeServer:
-    config_path = Path(__file__).resolve().parents[1] / "configs/multichallenge.yaml"
+    config_path = ROOT / "configs/multichallenge.yaml"
     raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["multichallenge"]["resources_servers"][
         "multichallenge"
     ]
@@ -69,6 +72,21 @@ def make_server() -> MultiChallengeServer:
         {"host": "127.0.0.1", "port": 8080, "name": "multichallenge", **raw_config}
     )
     return MultiChallengeServer(config=config, server_client=MagicMock(spec=ServerClient))
+
+
+def test_checked_in_example_matches_verify_request_contract() -> None:
+    example = yaml.safe_load((ROOT / "data/example.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+    request = MultiChallengeVerifyRequest.model_validate(
+        {**example, "response": make_response("Alex, try a nut-free snack.")}
+    )
+
+    assert request.context
+    assert request.context.endswith(request.responses_create_params.input[-1].content)
+    assert request.rubric is not None
+    assert [item["pass_criteria"] for item in request.rubric] == ["YES", "YES"]
+    assert request.agent_ref is not None
+    assert request.agent_ref["name"] == "multichallenge_simple_agent"
 
 
 class TestMultiChallenge:
