@@ -19,6 +19,7 @@ from typing import Any, Optional
 from warnings import warn
 
 from fastapi import Body, FastAPI, Request
+from pydantic import Field, field_validator
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -27,6 +28,13 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
 )
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT
+from nemo_gym.episode import (
+    AgentCloseSessionRequest,
+    AgentCloseSessionResponse,
+    AgentSeedSessionRequest,
+    AgentSeedSessionResponse,
+    ToolAccess,
+)
 from nemo_gym.global_config import (
     OBSERVABILITY_ENABLED_KEY_NAME,
     TOKEN_ID_CAPTURE_BLOCK,
@@ -58,6 +66,15 @@ class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
     # The run-level ``token_id_capture.enabled`` setting gates the capture infrastructure.
     # The run-level ``token_id_capture.all_agents`` setting overrides this agent-level choice.
     token_id_capture: bool = False
+    tool_accesses: list[ToolAccess] = Field(default_factory=list)
+
+    @field_validator("tool_accesses")
+    @classmethod
+    def require_unique_tool_names(cls, tool_accesses: list[ToolAccess]) -> list[ToolAccess]:
+        names = [access.name for access in tool_accesses]
+        if len(names) != len(set(names)):
+            raise ValueError("configured tool access names must be unique")
+        return tool_accesses
 
 
 class BaseResponsesAPIAgent(BaseServer):
@@ -66,6 +83,12 @@ class BaseResponsesAPIAgent(BaseServer):
 
 class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, SimpleServer):
     config: BaseResponsesAPIAgentConfig
+
+    def effective_tool_accesses(self, request: AgentSeedSessionRequest) -> list[ToolAccess]:
+        """Overlay episode-scoped tool access onto configured declarations by name."""
+        accesses = {access.name: access for access in self.config.tool_accesses}
+        accesses.update((access.name, access) for access in request.tool_accesses)
+        return list(accesses.values())
 
     def setup_webserver(self) -> FastAPI:
         app = FastAPI()
@@ -98,8 +121,26 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
 
         app.post("/run")(run_with_rollout_context)
         app.post("/aggregate_metrics")(self.aggregate_metrics)
+        app.post("/v1/agent_sessions")(self.seed_agent_session)
+        app.post("/v1/agent_sessions/close")(self.close_agent_session)
 
         return app
+
+    async def seed_agent_session(
+        self,
+        request: Request,
+        body: AgentSeedSessionRequest,
+    ) -> AgentSeedSessionResponse:
+        """Create agent-owned session state."""
+        raise NotImplementedError("This agent does not implement episode sessions")
+
+    async def close_agent_session(
+        self,
+        request: Request,
+        body: AgentCloseSessionRequest,
+    ) -> AgentCloseSessionResponse:
+        """Close agent-owned session state."""
+        raise NotImplementedError("This agent does not implement episode sessions")
 
     def _capture_correlation_enabled(self) -> bool:
         """Return whether this agent needs rollout correlation.
