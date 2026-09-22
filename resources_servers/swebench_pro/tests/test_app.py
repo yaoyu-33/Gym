@@ -70,6 +70,64 @@ def request_body() -> dict:
     }
 
 
+@pytest.mark.asyncio
+async def test_failed_seed_retains_sandbox_and_original_error_for_shutdown_retry(monkeypatch):
+    server = make_server(golden=False, apply_anti_cheating=False)
+    sandbox = SimpleNamespace(
+        exec=AsyncMock(),
+        serialize=AsyncMock(side_effect=ValueError("bad descriptor")),
+        stop=AsyncMock(side_effect=[RuntimeError("cannot stop"), None]),
+    )
+    monkeypatch.setattr(server, "_create_sandbox", AsyncMock(return_value=sandbox))
+    seed = ResourcesSeedSessionRequest(
+        episode_id=EpisodeId(rollout_id="rollout"),
+        task_id=TaskId(taskset="pro", task_id="instance_example"),
+        task_data=request_body(),
+    )
+    with pytest.raises(ValueError, match="bad descriptor"):
+        await server.seed_session(SimpleNamespace(session={SESSION_ID_KEY: "seed-failed"}), seed)
+    assert server._session_id_to_sandbox["seed-failed"] is sandbox
+    await server.shutdown()
+    assert sandbox.stop.await_count == 2
+    assert not server._session_id_to_sandbox
+
+
+@pytest.mark.asyncio
+async def test_extract_cleanup_failure_keeps_owner_handle(monkeypatch):
+    server = make_server(golden=False)
+    sandbox = SimpleNamespace(
+        exec=AsyncMock(return_value=SimpleNamespace(return_code=0, stdout="model patch")),
+        stop=AsyncMock(side_effect=[RuntimeError("cannot stop"), None]),
+    )
+    server._session_id_to_sandbox["session"] = sandbox
+    assert await server._extract_model_patch("session", "base") == "model patch"
+    assert server._session_id_to_sandbox["session"] is sandbox
+    await server.shutdown()
+    assert sandbox.stop.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_empty_test_report_after_setup_failure_is_retried(monkeypatch):
+    server = make_server(golden=True, inconclusive_verification_retries=1)
+    monkeypatch.setattr(server, "_create_sandbox", AsyncMock(return_value=SimpleNamespace(stop=AsyncMock())))
+    verify = AsyncMock(
+        return_value=VerificationResult(
+            completed=True,
+            resolved=False,
+            patch_applied=True,
+            test_results={"tests": []},
+            test_output="npm install: getaddrinfo EAI_AGAIN registry.npmjs.org",
+        )
+    )
+    monkeypatch.setattr("resources_servers.swebench_pro.app.run_verification", verify)
+    from resources_servers.swebench_pro.app import SWEBenchProVerifyRequest
+
+    await server.verify(
+        SimpleNamespace(session={SESSION_ID_KEY: "verify"}), SWEBenchProVerifyRequest.model_validate(request_body())
+    )
+    assert verify.await_count == 2
+
+
 def make_server(
     *,
     golden: bool,

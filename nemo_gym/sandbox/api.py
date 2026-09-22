@@ -545,14 +545,14 @@ class AsyncSandbox:
     async def stop(self) -> None:
         if self._closed:
             return
-        try:
-            if self._handle is not None and not self._stopped:
-                await self._provider.close(self._handle)
-                self._stopped = True
-        finally:
-            if self._owns_provider:
-                await self._provider.aclose()
-                self._closed = True
+        # A failed remote stop must remain retryable by its resources owner.
+        # Closing the provider in finally would turn the next stop into a no-op
+        # even though the task container may still be running.
+        if self._handle is not None and not self._stopped:
+            await self._provider.close(self._handle)
+            self._stopped = True
+        if self._owns_provider:
+            await self._provider.aclose()
         self._closed = True
 
     async def disconnect(self) -> None:

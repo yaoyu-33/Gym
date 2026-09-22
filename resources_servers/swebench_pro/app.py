@@ -16,6 +16,7 @@
 """SWE-bench Pro resources server."""
 
 import asyncio
+import logging
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -47,6 +48,7 @@ from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.server_utils import SESSION_ID_KEY
 from nemo_gym.single_agent_episode_types import ResponsesResourcesVerifyRequest
+from resources_servers.swebench_pro.image_cache import digest_hex, verify_local_image
 from resources_servers.swebench_pro.verification import (
     DEFAULT_ENVIRONMENT_REPAIRS,
     VerificationInputs,
@@ -61,6 +63,7 @@ from resources_servers.swebench_pro.verification import (
 
 # K8s maps localhost to ::1 and Node 17+ honours that, but servers under test bind IPv4.
 SANDBOX_ENV_OVERRIDES = {"NODE_OPTIONS": "--dns-result-order=ipv4first"}
+LOG = logging.getLogger(__name__)
 
 
 # Blanked on the spec so the agent sees a clean env; the entryscript unsets them for real.
@@ -130,6 +133,7 @@ class SWEBenchProResourcesServerConfig(BaseResourcesServerConfig):
     # Which container repairs to apply; see `ENVIRONMENT_REPAIRS`.
     environment_repairs: tuple[str, ...] = DEFAULT_ENVIRONMENT_REPAIRS
     image_repository: str = "docker.io/jefzda/sweap-images"
+    image_template: str | None = None
     sandbox_provider: str
     sandbox_config: dict[str, Any]
 
@@ -202,6 +206,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         self._session_id_to_pristine_untracked: dict[str, frozenset[str]] = {}
         self._session_id_to_task: dict[str, SWEBenchProInstanceRequest] = {}
         self._session_id_to_identity: dict[str, tuple[EpisodeId, TaskId]] = {}
+        self._pending_verification_cleanup: list[AsyncSandbox] = []
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -220,21 +225,47 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         return app
 
     async def shutdown(self) -> None:
-        sandboxes = list(self._session_id_to_sandbox.values())
-        self._session_id_to_sandbox.clear()
-        self._session_id_to_pristine_untracked.clear()
-        self._session_id_to_task.clear()
-        self._session_id_to_identity.clear()
-        for sandbox in sandboxes:
+        for session_id in list(self._session_id_to_sandbox):
             try:
-                await sandbox.stop()
+                await self._stop_task_sandbox(session_id)
             except Exception:
-                print("Failed to stop abandoned SWE-bench Pro sandbox", format_exc(), file=sys.stderr)
+                LOG.exception("Failed to stop abandoned SWE-bench Pro sandbox %s", session_id)
+            else:
+                self._session_id_to_task.pop(session_id, None)
+                self._session_id_to_identity.pop(session_id, None)
+        for sandbox in list(self._pending_verification_cleanup):
+            try:
+                async with asyncio.timeout(self.config.verification_stop_timeout):
+                    await sandbox.stop()
+            except Exception:
+                LOG.exception("Failed to stop abandoned verification sandbox")
+            else:
+                self._pending_verification_cleanup.remove(sandbox)
+
+    async def _stop_task_sandbox(self, session_id: str) -> None:
+        sandbox = self._session_id_to_sandbox.get(session_id)
+        if sandbox is not None:
+            async with asyncio.timeout(self.config.verification_stop_timeout):
+                await sandbox.stop()
+        self._session_id_to_sandbox.pop(session_id, None)
+        self._session_id_to_pristine_untracked.pop(session_id, None)
 
     def _image(self, body: SWEBenchProInstanceRequest) -> str:
+        if self.config.image_template:
+            return self.config.image_template.format(
+                instance_id=body.instance_id,
+                dockerhub_tag=body.dockerhub_tag,
+                image_digest_hex=digest_hex(body.image_digest),
+            )
         if body.image_digest:
             return f"{self.config.image_repository}@{body.image_digest}"
         return f"{self.config.image_repository}:{body.dockerhub_tag}"
+
+    def _image_info(self, body: SWEBenchProInstanceRequest) -> dict[str, Any]:
+        image = self._image(body)
+        if self.config.image_template:
+            return verify_local_image(Path(image), f"docker://{self.config.image_repository}@{body.image_digest}")
+        return {"image": image, "source_uri": image}
 
     async def _create_sandbox(
         self,
@@ -244,8 +275,9 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         global_config_dict = get_global_config_dict()
         provider_config = resolve_provider_config(self.config.sandbox_provider, global_config_dict)
         provider_metadata = resolve_provider_metadata(self.config.sandbox_provider, global_config_dict)
+        image_info = await asyncio.to_thread(self._image_info, body)
         spec = SandboxSpec(
-            image=self._image(body),
+            image=image_info["image"],
             ttl_s=self.config.sandbox_config.get("ttl_s"),
             ready_timeout_s=self.config.sandbox_config.get("ready_timeout_s"),
             workdir="/app",
@@ -289,10 +321,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         body: SWEBenchProSeedSessionRequest | ResourcesSeedSessionRequest,
     ) -> SWEBenchProSeedSessionResponse | ResourcesSeedSessionResponse:
         session_id = request.session[SESSION_ID_KEY]
-        self._session_id_to_pristine_untracked.pop(session_id, None)
-        previous = self._session_id_to_sandbox.pop(session_id, None)
-        if previous is not None:
-            await previous.stop()
+        await self._stop_task_sandbox(session_id)
         self._session_id_to_task.pop(session_id, None)
         self._session_id_to_identity.pop(session_id, None)
 
@@ -305,6 +334,8 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         if native_request and body.task_id.task_id != task.instance_id:
             raise ValueError("TaskId does not match the SWE-bench Pro instance_id")
         sandbox = await self._create_sandbox(task)
+        # Track ownership before setup/serialization, including failed seeds.
+        self._session_id_to_sandbox[session_id] = sandbox
         try:
             if self.config.apply_anti_cheating:
                 anti_cheat_setup_fpath = Path(__file__).parent.parent / "swebench" / "anti_cheat_setup.sh"
@@ -322,7 +353,10 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             pristine_untracked = await self.pristine_untracked_files(sandbox)
             descriptor = await sandbox.serialize() if native_request else None
         except BaseException:
-            await sandbox.stop()
+            try:
+                await self._stop_task_sandbox(session_id)
+            except Exception:
+                LOG.exception("Cleanup failed after SWE Pro seed failure; retained for shutdown retry")
             raise
 
         self._session_id_to_task[session_id] = task
@@ -381,11 +415,9 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             return drop_patch_sections(result.stdout or "", pristine_untracked)
         finally:
             try:
-                await original_sandbox.stop()
+                await self._stop_task_sandbox(session_id)
             except Exception:
-                print("Failed to stop agent sandbox", format_exc(), file=sys.stderr)
-            self._session_id_to_sandbox.pop(session_id, None)
-            self._session_id_to_pristine_untracked.pop(session_id, None)
+                LOG.exception("Failed to stop task sandbox; retained for resources close/shutdown retry")
 
     async def verify(
         self,
@@ -459,6 +491,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
                         async with asyncio.timeout(self.config.verification_stop_timeout):
                             await eval_sandbox.stop()
                     except Exception:
+                        self._pending_verification_cleanup.append(eval_sandbox)
                         print("Failed to stop verification sandbox", format_exc(), file=sys.stderr)
 
             reason = inconclusive_reason(result, asdict(inputs))
@@ -484,6 +517,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             )
 
         response_data = body.model_dump() | {
+            "image_provenance": await asyncio.to_thread(self._image_info, body),
             "reward": float(result.resolved),
             "evaluation_completed": result.completed,
             "resolved": result.resolved,
@@ -512,10 +546,7 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             raise ValueError(f"Unknown resources session: {session_id}")
         if body.episode_id != identity[0]:
             raise ValueError("episode_id does not match the seeded resources session")
-        sandbox = self._session_id_to_sandbox.get(session_id)
-        if sandbox is not None:
-            await sandbox.stop()
-        self._session_id_to_sandbox.pop(session_id, None)
+        await self._stop_task_sandbox(session_id)
         self._session_id_to_task.pop(session_id, None)
         self._session_id_to_identity.pop(session_id, None)
         self._session_id_to_pristine_untracked.pop(session_id, None)
