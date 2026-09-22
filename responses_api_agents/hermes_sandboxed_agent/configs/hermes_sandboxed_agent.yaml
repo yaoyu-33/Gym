@@ -11,7 +11,7 @@ hermes_sandboxed_agent:
         name: policy_model
       model: ???
       runtime_python: /opt/hermes/bin/hermes-python
-      hermes_commit: 2237be355906fbe6065ce1815711eee52b2d646e
+      hermes_commit: 2237be355906fbe6065ce1815711eee52b2d646e  # Public commit; pragma: allowlist secret
       max_turns: 90
       concurrency: 4
 
