@@ -26,7 +26,27 @@ Configure the resources server's provider to mount `/shared/hermes-runtime` read
 
 The agent checks the selected interpreter, pinned Hermes import, and required runtime assets when seeding the actual sandbox, before activation. A remote task runtime cannot be checked at agent-server startup because no task sandbox exists yet.
 
-## Compose the native path
+## OpenClaw, Pi, and Codex runtime
+
+These three adapters also borrow the resources sandbox through EnvironmentServer sessions. They do not invoke a CLI on the agent-server host. OpenCode already has a separate sandboxed integration; it is not changed here.
+
+Prepare the shared runtime on Linux x86-64 **glibc**:
+
+```bash
+DEPS_DIR=/shared/gym-cli bash scripts/prepare_sandboxed_cli_runtime.sh
+```
+
+The builder pins Node 22.19.0, Pi 0.80.2, OpenClaw 2026.6.11, and Codex 0.144.4. Mount the resulting directory read-only at `/opt/gym-cli`. Launchers use that Node interpreter without replacing the benchmark's tool PATH. Each activation has a fresh HOME outside `/app`; tools use the resources-provided workdir. This builder does **not** establish musl/Alpine compatibility. Those task images remain a validation gap for this draft.
+
+Use `responses_api_agents/<name>_sandboxed_agent/configs/<name>_sandboxed_agent.yaml`, where `<name>` is `pi`, `openclaw`, or `codex`. The corresponding environment is `swe_pro_<name>`. Each config includes the resources-only config below. Set the model name and provider runtime mount explicitly.
+
+Pi and OpenClaw use Chat Completions against Gym's rollout proxy. Codex uses Gym's Responses frontend (`wire_api = "responses"`), not a direct vLLM Responses endpoint. Validate the selected Gym model adapter's backend route separately. Inputs support one user text turn plus system/developer text and `instructions`; unsupported request tool/sampling controls fail explicitly. Pi/OpenClaw accept request `max_output_tokens`; per-request temperature and Codex token overrides are not supported by these pinned adapters.
+
+The Linux CLI runner establishes a child-subreaper boundary, kills and reaps descendants (including detached tool jobs), and reports success only after cleanup. Failure to confirm cleanup blocks verification. OpenClaw recovers incrementally written transcripts after timeout. Responses preserve actual reasoning/tool output and usage; observation gaps explicitly cover unavailable model-call ownership, timing, and subagent hierarchy. Neither the process boundary nor transcript files are a security boundary against a malicious harness.
+
+All three remain unvalidated with Super 3.5 + SWE Pro: run the before/after checklist below per harness and pin, including Linux cleanup and platform-specific task images. Do not infer score parity from the shared adapter tests.
+
+## Compose the Hermes native path
 
 Keep your existing model and sandbox-provider configurations. Add the resources-only config and this agent/environment config:
 

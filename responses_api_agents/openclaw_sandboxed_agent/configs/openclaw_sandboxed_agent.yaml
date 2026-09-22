@@ -1,0 +1,27 @@
+config_paths:
+  - resources_servers/swebench_pro/configs/swebench_pro_resources_server.yaml
+
+openclaw_sandboxed_agent:
+  responses_api_agents:
+    openclaw_sandboxed_agent:
+      entrypoint: app.py
+      num_workers: 1
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: ???
+      cli_version: 2026.6.11
+      concurrency: 4
+
+swe_pro_openclaw:
+  environment_servers:
+    single_agent:
+      entrypoint: app.py
+      default_episode_timeout_seconds: 7200
+      cleanup_timeout_seconds: 180
+      resources_server:
+        type: resources_servers
+        name: swebench_pro_resources_server
+      agent_server:
+        type: responses_api_agents
+        name: openclaw_sandboxed_agent
