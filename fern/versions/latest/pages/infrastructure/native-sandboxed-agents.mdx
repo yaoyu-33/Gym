@@ -1,0 +1,86 @@
+---
+title: "Native sandboxed agents"
+description: "Run pinned harnesses in resources-owned sandboxes through EnvironmentServer sessions."
+---
+
+# Native sandboxed agents
+
+<Warning>
+This integration depends on the EnvironmentServer PR stack. It is a draft, not a validated Super 3.5 benchmark recipe. Live-model score parity and live provider cleanup must be checked before use for reported results.
+</Warning>
+
+The EnvironmentServer creates the resources session, seeds the agent with `SandboxAccess`, invokes one rollout-prefixed Responses activation, closes the agent, verifies, and closes resources. The agent never creates or stops the task sandbox and never changes reward or masking. Required external HTTP/MCP tools and unseeded calls are rejected; there is no host-workspace fallback. Process-local sessions require one worker.
+
+## Hermes runtime
+
+Hermes uses the portable runtime from PR #3542, pinned to commit `2237be355906fbe6065ce1815711eee52b2d646e`. The Gym agent server does not import or install Hermes. This isolates incompatible Python/OpenAI dependencies and supports offline execution in both glibc and Alpine/musl task images without replacing the benchmark's Python toolchain.
+
+On a Linux x86-64 runtime preparation host, prepare both variants once:
+
+```bash
+DEPS_DIR=/shared/hermes-runtime bash responses_api_agents/hermes_sandboxed_agent/prepare_runtime.sh
+DEPS_DIR=/shared/hermes-runtime/musl ARCH=x86_64-unknown-linux-musl bash responses_api_agents/hermes_sandboxed_agent/prepare_runtime.sh
+```
+
+Configure the resources server's provider to mount `/shared/hermes-runtime` read-only at `/opt/hermes`, or bake that directory into the task image. Do not put it inside `/app`. Apptainer reconnect requires the same host, UID, staging filesystem, and provider configuration as the resources worker. Its descriptor is trusted control-plane data, not a restricted security token.
+
+The agent checks the selected interpreter, pinned Hermes import, and required runtime assets when seeding the actual sandbox, before activation. A remote task runtime cannot be checked at agent-server startup because no task sandbox exists yet.
+
+## Compose the native path
+
+Keep your existing model and sandbox-provider configurations. Add the resources-only config and this agent/environment config:
+
+```bash
+gym env start \
+  --config /path/to/model-and-sandbox.yaml \
+  --config resources_servers/swebench_pro/configs/swebench_pro_resources_server.yaml \
+  --config responses_api_agents/hermes_sandboxed_agent/configs/hermes_sandboxed_agent.yaml \
+  ++hermes_sandboxed_agent.responses_api_agents.hermes_sandboxed_agent.model=YOUR_MODEL_NAME
+```
+
+The resources configuration name is `swebench_pro_resources_server`; the environment name is `swe_pro_hermes`. Confirm the resolved model, provider, runtime mount, evaluation limits, and anti-cheating settings before starting. This layer does not include the later taskset-routing PRs. For a standalone smoke test, submit a native request to the environment `/run`, not the agent `/run`.
+
+Convert one existing prepared SWE Pro row (including its pinned evaluator assets) to the native envelope:
+
+```python
+import json
+from pathlib import Path
+
+row = json.loads(Path("prepared-pro.jsonl").read_text().splitlines()[0])
+params = row.pop("responses_create_params")
+episode = {
+    "episode_id": {"rollout_id": "swe-pro-smoke", "attempt": 0},
+    "task": {
+        "task_id": {"taskset": "swe-pro-smoke", "task_id": row["instance_id"]},
+        "task_input": {"responses_create_params": params, "task_data": row},
+    },
+}
+Path("episode.json").write_text(json.dumps(episode))
+```
+
+```bash
+curl --fail-with-body -H 'Content-Type: application/json' \
+  --data-binary @episode.json "${ENVIRONMENT_URL}/run"
+```
+
+Only model input/configuration is uploaded to the task sandbox; gold patches and verifier metadata remain on the resources side. The runtime calls Gym's rollout-scoped model proxy using Chat Completions and a dummy proxy key, never the provider credential. Explicit request temperature and maximum output tokens take precedence over agent defaults.
+
+## Cleanup and failed rollouts
+
+The runner owns its wall-clock budget and snapshots its trajectory before closing Hermes and checking tracked background jobs. The provider timeout includes a separate cleanup grace period. Agent close drains active work before disconnecting; it does not infer remote termination from a cancelled HTTP caller. A close timeout, known leftover process, or ambiguous provider timeout blocks verification. Resources still perform their owner cleanup through EnvironmentServer's cleanup stack.
+
+This is cooperative lifecycle handling, not a hardened security boundary against a malicious harness or untracked daemon. Provider failures can leave an agent session requiring shutdown/operator cleanup. Successful close acknowledgements are retained in a bounded cache for network retries; this is not durable cross-worker session storage.
+
+Failed Hermes responses with completed execution remain available to the verifier. Unlike #3542's agent-owned `/run`, the adapter does not remove verifier rewards or convert results into a legacy failures-sidecar format. SWE Pro retains its existing conservative retry behavior for empty/missing required-test reports; the unsafe empty-report scoring change is not imported.
+
+## Before/after validation
+
+Use exactly the same checkpoint, Hermes commit, prompts, task/image digests, sampling parameters, toolsets, context window, turn/wall budgets, and verifier settings on #3542 and this native path. Changing those is a new baseline, not evidence of architecture parity.
+
+1. Run representative glibc and Alpine/musl tasks, first individually, then concurrently.
+2. Inspect actual model calls, tool operations in `/app`, complete and partial trajectories, and the extracted patch. Verify no harness command ran on the agent-server host.
+3. Compare per-task reward, `mask_sample`, verification completion, required-test outcomes, failures, and the denominator of aggregate scores. Do not hide missing rows or compare only successful episodes.
+4. Compare usage, reasoning/tool items, capture IDs including retry attempts, and observation gaps. This initial adapter returns transcript observations but does not claim complete model-call ownership or tool timing.
+5. Inject seed, connect, runtime, timeout, close, and verifier failures. Verify close precedes grading, a failed close prevents grading, and only resources stop the task sandbox. Check real provider inventory for leaks.
+
+Local tests exercise contracts and simulated failures; they do not establish a SWE Pro score. Record fresh Super 3.5 rollout artifacts and reviewed score/coverage evidence in the PR before marking it ready.

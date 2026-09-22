@@ -1,0 +1,26 @@
+hermes_sandboxed_agent:
+  responses_api_agents:
+    hermes_sandboxed_agent:
+      entrypoint: app.py
+      num_workers: 1
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      model: ???
+      runtime_python: /opt/hermes/bin/hermes-python
+      hermes_commit: 2237be355906fbe6065ce1815711eee52b2d646e
+      max_turns: 90
+      concurrency: 4
+
+swe_pro_hermes:
+  environment_servers:
+    single_agent:
+      entrypoint: app.py
+      default_episode_timeout_seconds: 7200
+      cleanup_timeout_seconds: 180
+      agent_server:
+        type: responses_api_agents
+        name: hermes_sandboxed_agent
+      resources_server:
+        type: resources_servers
+        name: swebench_pro_resources_server
