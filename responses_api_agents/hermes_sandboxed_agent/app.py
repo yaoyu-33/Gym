@@ -118,7 +118,7 @@ class HermesSandboxedAgent(SandboxedResponsesAPIAgent):
         )
         result = await self.download_json(session, "result.json")
         result = classify_stop(result)
-        if result.get("cleanup_confirmed") is False:
+        if result.get("cleanup_confirmed") is not True:
             session.execution_uncertain = True
         response = trajectory_response(
             result, body, self.config.model, "runner_exit" if executed.return_code else None

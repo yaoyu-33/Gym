@@ -195,7 +195,10 @@ def run(params):
         timed_out = True
         # Save before cancellation: a blocked tool or API worker may not unwind
         # before the sandbox provider's SIGKILL grace period expires.
-        write_json(Path(params["run_dir"]) / "result.json", classify_stop(progress_result(agent, n_input), True))
+        write_json(
+            Path(params["run_dir"]) / "result.json",
+            classify_stop(progress_result(agent, n_input), True) | {"cleanup_confirmed": False},
+        )
         agent.interrupt("sandbox timeout", hard_cancel=True)
 
     agent.step_callback = checkpoint
@@ -272,7 +275,13 @@ def main():
     try:
         result = run(params)
     except BaseException as exc:
-        result = {"completed": False, "failed": True, "error": str(exc), "error_type": type(exc).__name__}
+        result = {
+            "completed": False,
+            "failed": True,
+            "error": str(exc),
+            "error_type": type(exc).__name__,
+            "cleanup_confirmed": False,
+        }
         traceback.print_exc()
     write_json(Path(params["run_dir"]) / "result.json", result)
     return 1 if result.get("failed") or result.get("error") else 0

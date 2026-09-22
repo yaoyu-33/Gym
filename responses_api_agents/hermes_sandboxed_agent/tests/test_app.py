@@ -70,6 +70,21 @@ def test_sampling_falls_back_to_config(agent, session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marker", [None, False, True])
+async def test_only_explicit_cleanup_acknowledgement_allows_verification(agent, session, monkeypatch, marker):
+    result = {"completed": True, "messages": [{"role": "assistant", "content": "patched"}], "n_input": 0}
+    if marker is not None:
+        result["cleanup_confirmed"] = marker
+    monkeypatch.setattr(type(agent), "upload_text", AsyncMock())
+    monkeypatch.setattr(
+        type(agent), "exec_in_session", AsyncMock(return_value=SandboxExecResult(return_code=0, stdout="", stderr=""))
+    )
+    monkeypatch.setattr(type(agent), "download_json", AsyncMock(return_value=result))
+    await agent.execute_response(session, None, NeMoGymResponseCreateParamsNonStreaming(input="fix"))
+    assert session.execution_uncertain is (marker is not True)
+
+
+@pytest.mark.asyncio
 async def test_seed_checks_runtime_before_upload(agent, session, monkeypatch):
     execute = AsyncMock(return_value=SandboxExecResult(return_code=1, stdout="", stderr="wrong pin"))
     monkeypatch.setattr(type(agent), "exec_in_session", execute)
