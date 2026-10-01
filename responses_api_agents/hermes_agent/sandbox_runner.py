@@ -5,14 +5,11 @@
 
 from __future__ import annotations
 
-import ctypes
 import functools
 import json
 import os
 import signal
-import subprocess
 import sys
-import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -20,8 +17,10 @@ from uuid import uuid4
 
 
 try:
+    from .model_kwargs import _model_api_kwargs
     from .sandbox_observer import SandboxHermesObserver
 except ImportError:
+    from model_kwargs import _model_api_kwargs
     from sandbox_observer import SandboxHermesObserver
 
 
@@ -55,16 +54,32 @@ def _use_model_server(base_url: str) -> None:
     AIAgent.__init__ = initialize_without_streaming
 
 
-def _run(payload: dict[str, Any], exchange_dir: Path) -> dict[str, Any]:
+def _connect_mcp_servers(required: list[str]) -> None:
+    """Connect the MCP servers config.yaml lists for this episode and register their tools.
+
+    Hermes discovers MCP servers when ``run_agent`` is imported, which is before this episode's config exists.
+    """
+    from tools.mcp_tool import discover_mcp_tools, get_mcp_status
+
+    discover_mcp_tools()
+    connected = {server["name"] for server in get_mcp_status() if server["connected"]}
+    missing = sorted(set(required) - connected)
+    if missing:
+        raise RuntimeError("Required MCP servers did not connect: " + ", ".join(missing))
+
+
+def _run(payload: dict[str, Any], session_dir: Path, *, output_path: Path | None = None) -> dict[str, Any]:
     from run_agent import AIAgent
 
-    hermes_home = exchange_dir / "hermes-home"
+    hermes_home = session_dir / "hermes-home"
     hermes_home.mkdir(parents=True, exist_ok=True)
     (hermes_home / "config.yaml").write_text(payload["config_yaml"])
     os.environ["HERMES_HOME"] = str(hermes_home)
     os.environ["TERMINAL_ENV"] = "local"
     os.environ["TERMINAL_TIMEOUT"] = str(payload["terminal_timeout"])
     _use_model_server(payload["model_base_url"])
+    if payload["mcp_servers"]:
+        _connect_mcp_servers(payload["required_mcp_servers"])
 
     agent = AIAgent(
         base_url=payload["model_base_url"],
@@ -87,22 +102,40 @@ def _run(payload: dict[str, Any], exchange_dir: Path) -> dict[str, Any]:
     original_build_api_kwargs = agent._build_api_kwargs
 
     def build_api_kwargs(api_messages: list[dict[str, Any]]) -> dict[str, Any]:
-        kwargs = original_build_api_kwargs(api_messages)
-        if not payload["chat_template_kwargs_enabled"]:
-            return kwargs
-        chat_template_kwargs = kwargs.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
-        chat_template_kwargs.setdefault("enable_thinking", True)
-        chat_template_kwargs["truncate_history_thinking"] = False
-        # Gym accepts template overrides through metadata, not an extra top-level field.
-        kwargs["extra_body"].pop("chat_template_kwargs")
-        metadata = kwargs.setdefault("metadata", {})
-        previous = json.loads(metadata.get("chat_template_kwargs") or "{}")
-        metadata["chat_template_kwargs"] = json.dumps(previous | chat_template_kwargs)
-        return kwargs
+        return _model_api_kwargs(
+            original_build_api_kwargs(api_messages),
+            preserve_reasoning_history=payload["chat_template_kwargs_enabled"],
+            model_enable_thinking=payload.get("model_enable_thinking"),
+        )
 
     agent._build_api_kwargs = build_api_kwargs
     result = None
     error = None
+    timed_out = False
+    runtime = {"hostname": os.uname().nodename, "pid": os.getpid(), "python": sys.executable}
+
+    def progress() -> dict[str, Any]:
+        return {
+            "completed": False,
+            "interrupted": True,
+            "stop_reason": "wall_time",
+            "messages": getattr(agent, "_session_messages", [])
+            or [*payload["history"], {"role": "user", "content": payload["user_message"]}],
+        }
+
+    def interrupt(*_: object) -> None:
+        nonlocal timed_out
+        timed_out = True
+        # Save first: a blocked tool or API call may not unwind before the hard cleanup.
+        if output_path is not None:
+            partial = progress()
+            _write_atomic(
+                output_path,
+                {"result": partial, "observations": observer.finish(partial, None), "runtime": runtime},
+            )
+        agent.interrupt("sandbox timeout")
+
+    previous_handler = signal.signal(signal.SIGTERM, interrupt)
     try:
         result = agent.run_conversation(
             payload["user_message"],
@@ -111,24 +144,27 @@ def _run(payload: dict[str, Any], exchange_dir: Path) -> dict[str, Any]:
             task_id=payload["agent_session_id"],
         )
     except BaseException as exception:
-        error = exception
-        setattr(exception, "_sandbox_observations", observer.finish(result, error))
-        raise
+        if timed_out:
+            result = progress()
+        else:
+            error = exception
+            setattr(exception, "_sandbox_observations", observer.finish(result, error))
+            raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+    if timed_out and not result.get("failed"):
+        result = {**result, "completed": False, "interrupted": True, "stop_reason": "wall_time"}
     return {
         "observations": observer.finish(result, error),
         "result": result,
-        "runtime": {
-            "hostname": os.uname().nodename,
-            "pid": os.getpid(),
-            "python": sys.executable,
-        },
+        "runtime": runtime,
     }
 
 
 def _run_worker(input_path: Path, output_path: Path) -> int:
     exchange_dir = input_path.parent
     try:
-        output = _run(json.loads(input_path.read_text()), exchange_dir)
+        output = _run(json.loads(input_path.read_text()), exchange_dir, output_path=output_path)
     except BaseException as error:
         output = {
             "error": str(error),
@@ -148,81 +184,13 @@ def _run_worker(input_path: Path, output_path: Path) -> int:
     return 0
 
 
-def _drain_children(timeout: float) -> None:
-    """Kill and reap adopted descendants, including tools that start a new process group."""
-    children = Path(f"/proc/self/task/{os.getpid()}/children")
-    deadline = time.monotonic() + timeout
-    while True:
-        for child in children.read_text().split():
-            try:
-                os.kill(int(child), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        try:
-            while os.waitpid(-1, os.WNOHANG)[0]:
-                pass
-        except ChildProcessError:
-            return
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Hermes descendants remain alive; verification must not proceed")
-        time.sleep(0.01)
-
-
-def _supervise(command: list[str], *, cleanup_timeout: float) -> dict[str, Any]:
-    """Run Hermes as a child and acknowledge cleanup only after its descendants are gone."""
-    process = None
-    cleanup_confirmed = False
-    error = None
-    stopping = False
-
-    def interrupt(*_: object) -> None:
-        nonlocal stopping
-        # Do not interrupt Popen between process creation and handle assignment.
-        stopping = True
-
-    signal.signal(signal.SIGTERM, interrupt)
-    try:
-        if sys.platform != "linux":
-            raise RuntimeError("Native Hermes sessions require a Linux sandbox")
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-            raise OSError(ctypes.get_errno(), "Cannot establish Hermes child-subreaper boundary")
-        process = subprocess.Popen(command, start_new_session=True)
-        while process.poll() is None and not stopping:
-            time.sleep(0.05)
-    except Exception as exception:
-        error = str(exception)
-    finally:
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        try:
-            if process is not None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=cleanup_timeout)
-                _drain_children(cleanup_timeout)
-            cleanup_confirmed = True
-        except Exception as exception:
-            error = f"cleanup: {exception}"
-    return {"cleanup_confirmed": cleanup_confirmed, "error": error}
-
-
 def main() -> int:
-    worker = len(sys.argv) == 4 and sys.argv[1] == "--worker"
-    if not worker and len(sys.argv) != 3:
-        print("usage: sandbox_runner.py [--worker] INPUT_JSON OUTPUT_JSON", file=sys.stderr)
+    """Run the Hermes worker; the uploaded process supervisor owns its lifetime."""
+    if len(sys.argv) != 3:
+        print("usage: sandbox_runner.py INPUT_JSON OUTPUT_JSON", file=sys.stderr)
         return 2
     input_path, output_path = map(Path, sys.argv[-2:])
-    if worker:
-        return _run_worker(input_path, output_path)
-    payload = json.loads(input_path.read_text())
-    receipt = _supervise(
-        [sys.executable, str(Path(__file__).resolve()), "--worker", str(input_path), str(output_path)],
-        cleanup_timeout=payload["cleanup_timeout"],
-    )
-    _write_atomic(input_path.parent / "cleanup.json", receipt)
-    return 0 if receipt["cleanup_confirmed"] and receipt["error"] is None else 1
+    return _run_worker(input_path, output_path)
 
 
 if __name__ == "__main__":
