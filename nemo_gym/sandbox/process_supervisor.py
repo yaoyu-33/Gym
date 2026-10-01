@@ -85,6 +85,10 @@ def _supervise(
             return receipt  # The finally block confirms that no worker was launched.
         if sys.platform != "linux":
             raise RuntimeError("Sandbox process supervision requires Linux")
+        # Survive provider process-group cancellation to reap the worker and write its receipt.
+        # Exec launchers may already make us group leader; setsid would fail in that case.
+        if os.getpgrp() != os.getpid():
+            os.setsid()
         if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
             raise OSError(ctypes.get_errno(), "Cannot supervise sandbox tool processes")
         subreaping = True

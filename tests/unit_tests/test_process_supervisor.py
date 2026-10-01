@@ -138,6 +138,58 @@ raise SystemExit(supervisor['main']())
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper contract")
+def test_provider_group_kill_leaves_supervisor_alive_to_reap_worker(tmp_path: Path) -> None:
+    # Keep the shell as the provider group leader; the supervisor must leave that group.
+    process = subprocess.Popen(
+        [
+            "sh",
+            "-c",
+            '"$@" & wait',
+            "provider",
+            sys.executable,
+            "-I",
+            str(SUPERVISOR),
+            "--timeout",
+            "1",
+            "--cleanup-timeout",
+            "0.2",
+            "--receipt",
+            str(tmp_path / "cleanup.json"),
+            "--",
+            sys.executable,
+            "-c",
+            "import os, pathlib, time; pathlib.Path('worker.pid').write_text(str(os.getpid())); time.sleep(60)",
+        ],
+        cwd=tmp_path,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not (tmp_path / "worker.pid").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert (tmp_path / "worker.pid").exists()
+        worker_pid = int((tmp_path / "worker.pid").read_text())
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate(timeout=10)
+        receipt = json.loads((tmp_path / "cleanup.json").read_text())
+        assert receipt["timed_out"] is True
+        assert receipt["cleanup_confirmed"] is True
+        with pytest.raises(ProcessLookupError):
+            os.kill(worker_pid, 0)
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        if (tmp_path / "worker.pid").exists():
+            try:
+                os.kill(int((tmp_path / "worker.pid").read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux subreaper contract")
 def test_sigterm_during_spawn_does_not_lose_child_handle(tmp_path):
     # Deliver SIGTERM after the real child exists but before Popen returns to _supervise().
     # Isolate signal handlers/subreaper state from pytest, and always reap the test child.
