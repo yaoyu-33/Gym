@@ -20,9 +20,9 @@ from pydantic import ValidationError
 from nemo_gym.base_responses_api_agent import AgentCloseSessionRequest, AgentSeedSessionRequest
 from nemo_gym.episode_types import EpisodeId, TaskId
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.sandbox.runner import SandboxRunnerResult
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.pi_agent.app import PiAgent, PiAgentConfig, PiAgentRunRequest
-from responses_api_agents.pi_agent.sandbox import PiSandboxResult
 
 
 def seed(*, session_id: str = "pi-session") -> AgentSeedSessionRequest:
@@ -464,7 +464,7 @@ async def test_disconnect_failure_retains_session_for_retry(setup):
 
 def test_cleanup_receipt_is_required():
     with pytest.raises(ValueError):
-        PiSandboxResult.model_validate({"return_code": 0, "error": None})
+        SandboxRunnerResult.model_validate({"return_code": 0, "error": None})
 
 
 def test_instructions_and_text_parts_reach_pi_without_other_provider_credentials(setup):
