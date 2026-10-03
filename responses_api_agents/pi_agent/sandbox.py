@@ -14,8 +14,9 @@ from nemo_gym.base_responses_api_agent import AgentSessionState
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.rollout_observability import AgentObservationBundle
 from nemo_gym.sandbox import AsyncSandbox, process_supervisor
+from nemo_gym.sandbox.process_supervisor import CleanupReceipt
 from nemo_gym.sandbox.runner import (
-    SandboxRunnerResult,
+    RunnerRuntimeInfo,
     confirm_runner_cleanup,
     read_text,
     supervisor_command,
@@ -34,12 +35,12 @@ class PiSandboxSession(AgentSessionState):
     owns_sandbox: bool = field(default=False, kw_only=True)
     sandbox_stopped: bool = False
     task: asyncio.Task[NeMoGymResponse] | None = None
-    result: SandboxRunnerResult | None = None
+    runtime_info: RunnerRuntimeInfo | None = None
     observations: AgentObservationBundle | None = None
     activation_request: NeMoGymResponseCreateParamsNonStreaming | None = None
     closing: bool = False
     launch_started: bool = False
-    cleanup: dict[str, JsonValue] | None = None
+    cleanup: CleanupReceipt | None = None
     closed: bool = False
 
     async def upload_json(self, name: str, payload: JsonValue) -> None:
@@ -128,8 +129,10 @@ class PiSandboxSession(AgentSessionState):
         else:
             await self.stop_runner(close_timeout)
         try:
-            runtime = json.loads(await self.read_text("runtime.json"))
-            self.result = SandboxRunnerResult.model_validate({**self.cleanup, **runtime})
+            # Cleanup alone can acknowledge a fenced launch that never ran a worker.
+            if self.cleanup is None or self.cleanup["return_code"] is None:
+                raise RuntimeError("Sandbox runner has no worker exit code")
+            self.runtime_info = RunnerRuntimeInfo.model_validate_json(await self.read_text("runtime.json"))
             return await self.read_text("events.jsonl")
         except Exception as error:
             logs = await self.sandbox.exec(f"cat {quote(self.directory + '/runner.log')}", timeout_s=30)

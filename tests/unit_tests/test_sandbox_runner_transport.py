@@ -13,8 +13,9 @@ from pydantic import ValidationError
 
 from nemo_gym.sandbox.providers.base import SandboxExecResult
 from nemo_gym.sandbox.runner import (
-    SandboxRunnerResult,
+    RunnerRuntimeInfo,
     confirm_runner_cleanup,
+    parse_cleanup_receipt,
     read_text,
     supervisor_command,
     upload_text,
@@ -62,12 +63,9 @@ async def test_confirmed_receipt_does_not_signal_stored_pid(session):
     (directory / "cleanup.json").write_text(json.dumps(receipt))
     (directory / "runner.pid").write_text("12345")
     sandbox.exec = AsyncMock(side_effect=AssertionError("must not signal a possibly reused PID"))
-    assert (
-        await confirm_runner_cleanup(
-            sandbox, directory=str(directory), workdir=str(directory.parent), timeout=1, harness="test"
-        )
-        == receipt
-    )
+    assert await confirm_runner_cleanup(
+        sandbox, directory=str(directory), workdir=str(directory.parent), timeout=1, harness="test"
+    ) == parse_cleanup_receipt(receipt)
     sandbox.exec.assert_not_awaited()
 
 
@@ -76,7 +74,7 @@ async def test_stop_wins_claim_and_fences_delayed_launch(session):
     receipt = await confirm_runner_cleanup(
         sandbox, directory=str(directory), workdir=str(directory.parent), timeout=1, harness="test"
     )
-    assert receipt == {"cleanup_confirmed": True, "error": None}
+    assert receipt == {"cleanup_confirmed": True, "error": None, "return_code": None, "timed_out": False}
     assert (directory / "launch.claim").readlink() == Path("stop")
     assert (directory / "runner.stop").exists()
     command = supervisor_command(
@@ -86,9 +84,10 @@ async def test_stop_wins_claim_and_fences_delayed_launch(session):
     assert not (directory / "runner.pid").exists()
     assert not (directory / "runner.log").exists()
     assert not (directory / "started").exists()
-    # A fenced launch is safe to close, but must not masquerade as a completed run.
+    # A fenced launch is safe to close, without pretending a worker exited successfully.
+    assert receipt["return_code"] is None
     with pytest.raises(ValidationError):
-        SandboxRunnerResult.model_validate(receipt)
+        RunnerRuntimeInfo.model_validate(receipt)
 
 
 async def test_missing_receipt_after_launch_is_not_cleanup_confirmation(session):
@@ -115,42 +114,53 @@ async def test_unconfirmed_cleanup_preserves_receipt_for_retry(session, confirme
     assert json.loads(receipt_path.read_text()) == receipt
     receipt = {"cleanup_confirmed": True, "error": None}
     receipt_path.write_text(json.dumps(receipt))
-    assert (
-        await confirm_runner_cleanup(
-            sandbox, directory=str(directory), workdir=str(directory.parent), timeout=1, harness="test"
-        )
-        == receipt
-    )
+    assert await confirm_runner_cleanup(
+        sandbox, directory=str(directory), workdir=str(directory.parent), timeout=1, harness="test"
+    ) == parse_cleanup_receipt(receipt)
 
 
-def test_completed_result_preserves_supervisor_and_runtime_fields():
-    payload = {
-        "return_code": 0,
-        "timed_out": False,
-        "cleanup_confirmed": True,
-        "error": None,
-        "hostname": "sandbox",
-        "pid": 123,
-    }
-    assert SandboxRunnerResult.model_validate(payload).model_dump() == payload
-    for field in payload:
+def test_cleanup_and_runtime_are_independent():
+    cleanup = {"return_code": 0, "timed_out": False, "cleanup_confirmed": True, "error": None}
+    assert parse_cleanup_receipt(cleanup) == cleanup
+    runtime = RunnerRuntimeInfo.model_validate({"hostname": "sandbox", "pid": 123})
+    assert runtime.hostname == "sandbox" and runtime.pid == 123
+    assert runtime.python is None
+    with pytest.raises(ValidationError):
+        parse_cleanup_receipt(runtime.model_dump())
+    with pytest.raises(ValidationError):
+        RunnerRuntimeInfo.model_validate(cleanup)
+    for field in cleanup:
         with pytest.raises(ValidationError):
-            SandboxRunnerResult.model_validate({key: value for key, value in payload.items() if key != field})
+            parse_cleanup_receipt({key: value for key, value in cleanup.items() if key != field})
 
 
 @pytest.mark.parametrize(
-    "invalid", [{"return_code": "0"}, {"timed_out": "false"}, {"cleanup_confirmed": 1}, {"pid": "123"}, {"extra": 1}]
+    "invalid", [{"return_code": "0"}, {"timed_out": "false"}, {"cleanup_confirmed": 1}, {"hostname": "worker"}]
 )
-def test_completed_result_keeps_strict_validation(invalid):
+def test_cleanup_receipt_keeps_strict_validation(invalid):
     with pytest.raises(ValidationError):
-        SandboxRunnerResult.model_validate(
-            {
-                "return_code": 0,
-                "timed_out": False,
-                "cleanup_confirmed": True,
-                "error": None,
-                "hostname": "sandbox",
-                "pid": 123,
-                **invalid,
-            }
+        parse_cleanup_receipt(
+            {"return_code": 0, "timed_out": False, "cleanup_confirmed": True, "error": None, **invalid}
         )
+
+
+def test_absent_exit_code_is_not_success():
+    full = {"return_code": None, "timed_out": False, "cleanup_confirmed": True, "error": None}
+    assert parse_cleanup_receipt(full) == full
+    assert parse_cleanup_receipt({"cleanup_confirmed": True, "error": None}) == full
+    with pytest.raises(ValidationError):
+        parse_cleanup_receipt({"return_code": 0, "error": None})
+
+
+@pytest.mark.parametrize("invalid", [{"pid": "123"}, {"hostname": 123}, {"python": 123}, {"return_code": 0}])
+def test_runtime_info_keeps_strict_validation(invalid):
+    with pytest.raises(ValidationError):
+        RunnerRuntimeInfo.model_validate({"hostname": "sandbox", "pid": 123, **invalid})
+
+
+def test_hermes_runtime_uses_the_same_schema():
+    payload = {"hostname": "sandbox", "pid": 123, "python": "/opt/hermes/bin/python"}
+    assert RunnerRuntimeInfo.model_validate(payload).model_dump() == payload
+    for field in ("hostname", "pid"):
+        with pytest.raises(ValidationError):
+            RunnerRuntimeInfo.model_validate({key: value for key, value in payload.items() if key != field})
