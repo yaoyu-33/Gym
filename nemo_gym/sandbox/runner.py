@@ -12,21 +12,33 @@ from pathlib import Path
 from shlex import join, quote
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 from nemo_gym.sandbox import AsyncSandbox
+from nemo_gym.sandbox.process_supervisor import CleanupReceipt
 
 
-class SandboxRunnerResult(BaseModel):
-    """Validate the supervisor receipt plus runtime metadata for a completed launch."""
+_CLEANUP_RECEIPT = TypeAdapter(CleanupReceipt)
+
+
+class RunnerRuntimeInfo(BaseModel):
+    """Worker identity, independent of supervisor cleanup and harness output."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
-    return_code: int
-    timed_out: bool
-    cleanup_confirmed: bool
-    error: str | None
     hostname: str
     pid: int
+    python: str | None = None
+
+
+def parse_cleanup_receipt(payload: object) -> CleanupReceipt:
+    """Validate the supervisor's existing schema without adding worker dependencies.
+
+    Older stop-before-launch receipts contain only acknowledgement and error.
+    Normalize that form without inventing a successful worker exit code.
+    """
+    if isinstance(payload, dict) and payload.keys() == {"cleanup_confirmed", "error"}:
+        payload = {**payload, "return_code": None, "timed_out": False}
+    return _CLEANUP_RECEIPT.validate_python(payload, strict=True, extra="forbid")
 
 
 async def upload_text(sandbox: AsyncSandbox, *, path: str, text: str) -> None:
@@ -60,12 +72,12 @@ def supervisor_command(*, directory: str, command: list[str], timeout: float, cl
 
 async def confirm_runner_cleanup(
     sandbox: AsyncSandbox, *, directory: str, workdir: str, timeout: float, harness: str
-) -> dict[str, JsonValue]:
+) -> CleanupReceipt:
     """Fence a pending launch or require explicit supervisor acknowledgement before teardown.
 
     A stop that wins the launch claim writes a minimal receipt: no worker ran, so
-    runtime metadata and a return code are intentionally absent. Full result
-    validation is separate and applies only when the adapter consumes worker output.
+    runtime metadata and a return code are intentionally absent. Worker metadata
+    and harness output are validated separately by the adapter.
     """
     receipt_path = f"{directory}/cleanup.json"
     try:
@@ -95,4 +107,4 @@ async def confirm_runner_cleanup(
             raise RuntimeError(f"{harness} launch outcome is unknown; cannot confirm termination") from error
         if receipt.get("cleanup_confirmed") is not True:
             raise RuntimeError(f"{harness} sandbox cleanup was not confirmed: {receipt.get('error')}")
-    return receipt
+    return parse_cleanup_receipt(receipt)
