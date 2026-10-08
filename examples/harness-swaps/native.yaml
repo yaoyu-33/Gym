@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Shared setup for the literal gym eval run commands in the notebook.
+config_paths:
+  - examples/harness-swaps/common.yaml
+  - responses_api_agents/pi_agent/configs/pi_agent.yaml
+environment_routing_mode: agent
+environment_server_name: null
+head_server:
+  host: 127.0.0.1
+  port: ${oc.env:DEMO_HEAD_PORT}
+results_dir: ${oc.env:DEMO_RUN_DIR}
+nemo_gym_log_dir: ${results_dir}/logs
+model_call_capture_dir: ${results_dir}/model-calls
+output_jsonl_fpath: ${results_dir}/rollouts.jsonl
+num_repeats: 1
+num_samples_in_parallel: 1
+health_check_workers: 1
+pi_agent:
+  responses_api_agents:
+    pi_agent:
+      concurrency: 1
+      timeout: 1800
+      max_output_tokens: 32768
+pi_episode:
+  _inherit_from: single_agent_turn_legacy
+  environment_servers:
+    single_agent_turn_legacy:
+      agent_server:
+        name: pi_agent
+      resources_server:
+        name: ${demo_resources_server}
+sandbox:
+  docker:
+    create:
+      extra_run_args: [--label, 'gym-swap-demo=${oc.env:DEMO_RUN_ID}']

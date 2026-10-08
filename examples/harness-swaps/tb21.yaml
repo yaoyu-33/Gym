@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+config_paths:
+  - examples/harness-swaps/native.yaml
+  - resources_servers/terminal_bench_2_1/configs/terminal_bench_2_1.yaml
+demo_resources_server: terminal_bench_2_1_resources_server
+input_jsonl_fpath: examples/harness-swaps/data/tb21.jsonl
+terminal_bench_2_1_resources_server:
+  resources_servers:
+    terminal_bench_2_1:
+      sandbox_config:
+        resources: {cpu: 2, memory_mib: 8192, disk_gib: 30}

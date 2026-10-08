@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+config_paths:
+  - examples/harness-swaps/native.yaml
+  - resources_servers/swebench_pro/configs/swebench_pro.yaml
+  - responses_api_agents/hermes_agent/configs/hermes_agent.yaml
+demo_resources_server: swebench_pro_resources_server
+input_jsonl_fpath: examples/harness-swaps/data/swe-pro.jsonl
+hermes_agent:
+  responses_api_agents:
+    hermes_agent:
+      num_workers: 1
+      concurrency: 1
+      enabled_toolsets: [terminal]
+      max_turns: 100
+      max_tokens: 8192
+      temperature: 0.0
+      sandbox_runner_timeout_seconds: 1800
+hermes_episode:
+  _inherit_from: single_agent_turn_legacy
+  environment_servers:
+    single_agent_turn_legacy:
+      agent_server:
+        name: hermes_agent
+      resources_server:
+        name: ${demo_resources_server}
+swebench_pro_resources_server:
+  resources_servers:
+    swebench_pro:
+      num_workers: 1
+      sandbox_config:
+        resources: {cpu: 2, memory_mib: 8192, disk_gib: 30}

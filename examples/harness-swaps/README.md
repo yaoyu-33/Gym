@@ -2,8 +2,8 @@
 
 Choose a benchmark and a harness. Run a task. Change either choice and run again.
 
-This is a **demo notebook/helper**, not a new built-in Gym command. It uses the
-normal Gym CLI underneath. The branch includes the Pi/TB2.1 draft stack at
+The notebook runs the **actual Gym CLI**, with ordinary example YAML configs.
+There is no custom run alias in the demo. The branch includes the Pi/TB2.1 draft stack at
 `0e912e822804f09ccfb6feb131b25ea7b4bf7936`; these examples are not all on `main` yet.
 See [validation and known limitations](VALIDATION.md) for what was actually run.
 
@@ -54,35 +54,63 @@ jupyter lab examples/harness-swaps/demo.ipynb --ip 127.0.0.1 --no-browser
 ```
 
 Connect through SSH forwarding if running remotely. Leave Jupyter's token
-authentication enabled. Run the setup cells, then the three demo cells. First
+authentication enabled. Run each setup cell, its Gym command, and its cleanup cell. First
 startup installs per-server dependencies and each sandbox installs its harness;
 rehearse before recording. Every invocation creates new artifacts and closes
 its own services/containers. It does not stop your model endpoint or other runs.
 
 ## The demo
 
-The notebook exposes just two selectors:
-
-```python
-run(harness="hermes", benchmark="swe-pro")
-run(harness="pi", benchmark="swe-pro")  # Same task, model and verifier.
-run(harness="pi", benchmark="tb21")    # Same harness and model.
-```
-
-The identical command is also usable without Jupyter:
+The visible notebook cells execute these commands directly:
 
 ```bash
-alias demo='python examples/harness-swaps/run.py'
-demo --harness hermes --benchmark swe-pro
-demo --harness pi --benchmark swe-pro
-demo --harness pi --benchmark tb21
+gym eval run --no-serve \
+  --config examples/harness-swaps/swe-pro.yaml \
+  --agent hermes_agent --limit 1
+
+gym eval run --no-serve \
+  --config examples/harness-swaps/swe-pro.yaml \
+  --agent pi_agent --limit 1
+
+gym eval run --no-serve \
+  --config examples/harness-swaps/tb21.yaml \
+  --agent pi_agent --limit 1
 ```
 
-`demo` is a shell alias for this example helper, not a built-in Gym command.
-It defaults to the files created by `prepare.py`; use `--input FILE` to override.
-Add `--limit 2` for two tasks. `--task-id ID` selects an exact prepared task;
-repeat it for two IDs. Outputs go into a fresh directory under
-`results/harness-swaps/`. Keep raw logs, model captures, rollouts, health reports,
+Change `--agent` to swap the harness. Change `--config` to swap the benchmark.
+The SWE config makes both harnesses available against the same Resources server;
+the TB config includes Pi. The selected input file is declared in each config.
+These are example configs, not new benchmark catalog aliases.
+
+`--no-serve` requires running services. The notebook's setup cells start them
+with `gym env start --config ...`; they do not execute or wrap the eval command.
+Each setup uses a new results directory and an available Head port. Run the
+matching cleanup cell before switching benchmark services or repeating a run.
+
+Without Jupyter, after privately setting the model variables and activating the
+virtual environment, prepare one run in a terminal:
+
+```bash
+export DEMO_RUN_ID="swe-pro-$(date +%Y%m%d-%H%M%S)"
+export DEMO_RUN_DIR="$PWD/results/harness-swaps/$DEMO_RUN_ID"
+export DEMO_HEAD_PORT=48977  # Choose an unused port.
+mkdir -p results/harness-swaps
+mkdir -m 700 "$DEMO_RUN_DIR"
+gym env start --config examples/harness-swaps/swe-pro.yaml \
+  > "$DEMO_RUN_DIR/services.log" 2>&1 &
+DEMO_SERVICES_PID=$!
+./scripts/wait_for_servers.sh "$DEMO_SERVICES_PID" "$DEMO_HEAD_PORT" 900
+```
+
+Run the matching `gym eval run` command above in that same terminal. Then stop
+only this service process with `kill -INT "$DEMO_SERVICES_PID"`, then
+`wait "$DEMO_SERVICES_PID"` for shutdown. Check for leftover containers with
+`docker ps -a --filter "label=gym-swap-demo=$DEMO_RUN_ID"`. Do not prune other runs.
+For the next run, create a fresh ID/directory and start the matching config again.
+Do not reuse an output path: collection overwrites it by default.
+
+Use `--input FILE` to override the prepared task file or `--limit 2` for two tasks.
+Outputs go into `DEMO_RUN_DIR`. Keep raw logs, model captures, rollouts, health reports,
 `summary.json` and `cleanup.json` private. A valid reward of zero is different
 from incomplete verification. Read the health verdict, not just its file count.
 Unexpected missing rows, incomplete verification or leftover containers need
@@ -90,16 +118,15 @@ investigation before presenting the run as functional.
 
 ## How it works — separate from the user demo
 
-`run.py` composes three ordinary YAML files: shared model/provider settings,
-the benchmark's Resources config and the harness's Agent config. A generated
-run-local config binds the two names; no harness or verifier Python is rewritten.
+The example YAML composes shared model/provider settings, the benchmark's
+Resources config and each harness's Agent config. Native sessions bind the
+independent parts; no harness or verifier Python is rewritten.
 The flat prepared rows enter the native EnvironmentServer through
 `single_agent_turn_legacy`, which adapts row format, not execution to a host CLI.
 Both harnesses run inside the Resources-owned task sandbox.
 
-The helper starts `gym env start --config RUN_CONFIG`, waits for `/readyz`, then
-uses `gym eval run --no-serve --config RUN_CONFIG --agent AGENT --input INPUT ...`.
-The exact commands are saved in `manifest.json`. `--no-serve` is intentional:
+Setup starts `gym env start`, then the visible cell calls `gym eval run --no-serve`.
+`--no-serve` is intentional:
 this source's default E2E route prepares its declared dataset instead of simply
 collecting the selected input. No custom HTTP collector or fake reward is used.
 The hosted-model adapter applies a bounded 60-second retry delay for transient
@@ -108,8 +135,11 @@ retries on NVIDIA HTTP 429. This config does not add an upstream Responses API
 requirement: both harnesses call Chat Completions.
 Per-call output limits belong to each harness: Hermes uses 8,192 and Pi uses
 32,768. A shared model override must not silently replace those values. The first
-Pi rehearsal hit an 8K limit mid-response, so its recording is being repeated
-with the larger budget. These runs are not a matched-budget accuracy comparison.
+Pi rehearsal hit an 8K limit mid-response; the subsequent real Pi runs use the
+larger budget. These runs are not a matched-budget accuracy comparison.
+
+`run.py` remains an optional rehearsal helper and provides shared result/cleanup
+utilities for the notebook. Its old `demo` alias is not the presented interface.
 
 For these compatible pairs: **zero Python adapter edits per swap**. A new
 harness still needs its Agent adapter; a new benchmark needs data preparation

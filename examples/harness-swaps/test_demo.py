@@ -120,3 +120,46 @@ def test_progress_counts_unique_exchanges_and_ignores_partial_append(tmp_path):
     }
     (captures / "task.capture.jsonl").write_text(json.dumps(exchange) + "\n" + json.dumps(exchange) + '\n{"model')
     assert demo.trace_progress(tmp_path) == (1, 1)
+
+
+@pytest.mark.parametrize("benchmark,agents", [("swe-pro", ["hermes", "pi"]), ("tb21", ["pi"])])
+def test_native_cli_configs_route_each_agent(tmp_path, monkeypatch, benchmark, agents):
+    from omegaconf import OmegaConf
+
+    from environment_servers.single_agent_turn.app import SingleAgentTurnEnvironmentServerConfig
+    from nemo_gym.global_config import GlobalConfigDictParser, GlobalConfigDictParserConfig
+    from nemo_gym.rollout_collection import RolloutCollectionConfig, _environment_servers_by_agent
+
+    for name, value in {
+        "DEMO_MODEL_URL": "https://example.invalid/v1",
+        "DEMO_MODEL_NAME": "test-model",
+        "DEMO_MODEL_KEY": "placeholder",
+        "DEMO_GYM_HOST": "127.0.0.1",
+        "DEMO_HEAD_PORT": "48977",
+        "DEMO_RUN_DIR": str(tmp_path),
+        "DEMO_RUN_ID": "test-only",
+    }.items():
+        monkeypatch.setenv(name, value)
+    config = GlobalConfigDictParser().parse(
+        GlobalConfigDictParserConfig(
+            initial_global_config_dict=OmegaConf.create(
+                {"config_paths": [f"examples/harness-swaps/{benchmark}.yaml"]}
+            ),
+            skip_load_from_cli=True,
+            skip_load_from_dotenv=True,
+            offline=True,
+        )
+    )
+    expected = {f"{agent}_agent": [f"{agent}_episode"] for agent in agents}
+    assert _environment_servers_by_agent(config) == expected
+    resolved = OmegaConf.to_container(config, resolve=True)
+    for agent in agents:
+        params = resolved[f"{agent}_episode"]["environment_servers"]["single_agent_turn_legacy"]
+        validated = SingleAgentTurnEnvironmentServerConfig.model_validate(params | {"name": f"{agent}_episode"})
+        assert validated.agent_server.name == f"{agent}_agent"
+        assert validated.resources_server.name == f"{demo.BENCHMARKS[benchmark]}_resources_server"
+    collect = RolloutCollectionConfig.model_validate(resolved | {"agent_name": f"{agents[0]}_agent", "limit": 1})
+    assert collect.environment_routing_mode == "agent"
+    assert collect.input_jsonl_fpath == f"examples/harness-swaps/data/{benchmark}.jsonl"
+    assert collect.output_jsonl_fpath == str(tmp_path / "rollouts.jsonl")
+    assert collect.agent_map == {"_default": f"{agents[0]}_agent"}
