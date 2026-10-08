@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+config_paths:
+  - responses_api_models/openai_model/configs/openai_model.yaml
+  - nemo_gym/sandbox/providers/docker/configs/docker.yaml
+  - environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
+policy_base_url: ${oc.env:DEMO_MODEL_URL}
+policy_model_name: ${oc.env:DEMO_MODEL_NAME}
+policy_api_key: ${oc.env:DEMO_MODEL_KEY}
+use_absolute_ip: false
+default_host: ${oc.env:DEMO_GYM_HOST}
+skip_venv_if_present: true
+observability_enabled: true
+environment_routing_mode: legacy
+environment_server_name: single_agent_turn_legacy
+single_agent_turn_legacy:
+  environment_servers:
+    single_agent_turn_legacy:
+      resources_tool_transports: []
+      max_concurrent_episodes: 1
+      queue_timeout_seconds: 60
+      default_episode_timeout_seconds: 3600
+      cleanup_timeout_seconds: 300
+policy_model:
+  responses_api_models:
+    openai_model:
+      num_workers: 1
+      # These harnesses use Chat Completions; no upstream Responses endpoint is needed.
+      extra_body:
+        temperature: 0.0
+        max_tokens: 8192
+      max_concurrent_requests: 1
+      upstream_max_num_tries: 1
+      upstream_request_timeout_seconds: 300
+      upstream_retry_policy:
+        max_attempts: 3
+        pre_request_jitter_seconds: [2, 2]
+        backoff_initial_seconds: 60
+        backoff_multiplier: 1
+        terminal_http_status_codes: [400, 401, 403, 404, 422]
+sandbox:
+  docker:
+    create:
+      pids_limit: 512
+      security_opt: [no-new-privileges]
