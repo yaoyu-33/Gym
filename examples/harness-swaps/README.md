@@ -5,6 +5,7 @@ Choose a benchmark and a harness. Run a task. Change either choice and run again
 This is a **demo notebook/helper**, not a new built-in Gym command. It uses the
 normal Gym CLI underneath. The branch includes the Pi/TB2.1 draft stack at
 `0e912e822804f09ccfb6feb131b25ea7b4bf7936`; these examples are not all on `main` yet.
+See [validation and known limitations](VALIDATION.md) for what was actually run.
 
 ## Before recording
 
