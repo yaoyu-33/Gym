@@ -106,6 +106,10 @@ The hosted-model adapter applies a bounded 60-second retry delay for transient
 provider errors. The rehearsal's earlier vLLM-adapter attempt exhausted its short
 retries on NVIDIA HTTP 429. This config does not add an upstream Responses API
 requirement: both harnesses call Chat Completions.
+Per-call output limits belong to each harness: Hermes uses 8,192 and Pi uses
+32,768. A shared model override must not silently replace those values. The first
+Pi rehearsal hit an 8K limit mid-response, so its recording is being repeated
+with the larger budget. These runs are not a matched-budget accuracy comparison.
 
 For these compatible pairs: **zero Python adapter edits per swap**. A new
 harness still needs its Agent adapter; a new benchmark needs data preparation

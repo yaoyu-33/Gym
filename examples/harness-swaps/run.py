@@ -52,7 +52,7 @@ def composition(*, harness: str, benchmark: str, output: Path, head_port: int) -
     resources = BENCHMARKS[benchmark]
     settings = {"num_workers": 1, "concurrency": 1}
     if harness == "pi":
-        settings.update(timeout=1800, max_output_tokens=8192)
+        settings.update(timeout=1800, max_output_tokens=32768)
     else:
         settings.update(
             enabled_toolsets=["terminal"],

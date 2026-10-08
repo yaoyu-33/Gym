@@ -41,6 +41,17 @@ def test_concurrency_has_required_queue_deadline():
     assert env["queue_timeout_seconds"] > 0
 
 
+@pytest.mark.parametrize("harness,field,budget", [("hermes", "max_tokens", 8192), ("pi", "max_output_tokens", 32768)])
+def test_output_budget_is_owned_by_harness(tmp_path, harness, field, budget):
+    config = demo.composition(harness=harness, benchmark="swe-pro", output=tmp_path, head_port=12345)
+    agent = f"{harness}_agent"
+    assert config[agent]["responses_api_agents"][agent][field] == budget
+    common = yaml.safe_load(Path(__file__).with_name("common.yaml").read_text())
+    upstream = common["policy_model"]["responses_api_models"]["openai_model"]["extra_body"]
+    assert "max_tokens" not in upstream
+    assert "max_completion_tokens" not in upstream
+
+
 def test_selection_preserves_task_prompt_and_verifier(tmp_path):
     source = tmp_path / "input.jsonl"
     rows = [
