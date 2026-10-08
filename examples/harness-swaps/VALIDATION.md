@@ -19,6 +19,9 @@ Hermes collected one rollout with `evaluation_completed=true`,
 and CLI exit 0. It took approximately 31 minutes, including hosted-model rate
 limit waits. The three-minute video will shorten waits, not imply a three-minute
 benchmark runtime.
+The agent observation is `incomplete` with a configured 30-minute execution
+budget; the saved patch nevertheless passes all eight stock verifier tests.
+Completed verification is not the same as a naturally finished agent conversation.
 
 **Known health warning:** Hermes's response usage is still hard-coded to zero
 in this source. Model captures contain token usage, so the health report flags
