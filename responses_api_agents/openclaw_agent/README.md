@@ -191,9 +191,10 @@ Native request support is deliberately explicit:
 - The request `model`, when supplied, must match the configured model.
 - `max_output_tokens`, `temperature`, `top_p`, reasoning overrides, tool-selection controls, output
   schemas, history replay, and other unsupported Responses options are rejected before activation.
-  The native config also rejects `max_output_tokens`: model metadata does not prove an effective
-  inference limit. Configure sampling and per-call limits on the Gym model server and inspect the
-  effective captured requests. An episode-wide token budget is not implemented.
+  The configured `max_output_tokens` is written as `maxTokens` of the generated model entry, so it
+  is the per-call output limit OpenClaw requests; when unset, OpenClaw's own default applies. Model
+  metadata does not prove an effective inference limit: verify it against the captured requests on
+  the Gym model server. An episode-wide token budget is not implemented.
 - Custom command, environment, OpenClaw config, Node path, extra arguments, and agent-ID overrides
   are rejected for native sessions. Existing callers without an agent-session cookie retain the
   local CLI behavior and configuration. Both paths now include request `instructions` in the
