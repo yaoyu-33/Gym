@@ -25,6 +25,9 @@ openclaw_agent:
       resources_server:
         type: resources_servers
         name: gdpval_resources_server
+      # Per-call output limit requested from the model; GDPval deliverables
+      # regularly exceed the harness default. Same value as the OpenCode recipe.
+      max_output_tokens: 32768
 single_agent_turn_legacy:
   environment_servers:
     single_agent_turn_legacy:

@@ -25,6 +25,9 @@ opencode_agent:
       # Native session: borrow the GDP task sandbox; Resources owns its lifecycle.
       execution_mode: sandbox
       model: ${policy_model_name}
+      # Episode wall clock in seconds. GDPval tasks produce multi-file
+      # deliverables and routinely outlast the harness default.
+      timeout: 7200
 single_agent_turn_legacy:
   environment_servers:
     single_agent_turn_legacy:
