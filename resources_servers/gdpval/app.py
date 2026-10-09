@@ -286,6 +286,10 @@ class GDPValResourcesServerConfig(BaseResourcesServerConfig):
     sandbox_provider: Optional[str] = None
     image: Optional[str] = Field(default=None, min_length=1)
     deliverables_root: Optional[Path] = None
+    # Per-file cap for staged reference inputs; some GDP tasks ship video inputs above 128 MiB.
+    max_reference_bytes: int = Field(default=_MAX_BYTES, gt=0)
+    # Total time allowed for one reference download; large media inputs need more than the default.
+    reference_download_timeout_seconds: float = Field(default=180, gt=0, allow_inf_nan=False)
 
     @field_validator("deliverables_root")
     @classmethod
@@ -633,7 +637,9 @@ class GDPValResourcesServer(SimpleResourcesServer):
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
         with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:
             for name, url in zip(task.reference_files, task.reference_file_urls, strict=True):
-                response = await http_request("GET", url, timeout=ClientTimeout(total=180))
+                response = await http_request(
+                    "GET", url, timeout=ClientTimeout(total=self.config.reference_download_timeout_seconds)
+                )
                 try:
                     response.raise_for_status()
                     local = Path(scratch) / "reference"
@@ -641,8 +647,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     with local.open("wb") as stream:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
                             size += len(chunk)
-                            if size > _MAX_BYTES:
-                                raise RuntimeError("Reference file exceeds prototype download limit")
+                            if size > self.config.max_reference_bytes:
+                                raise RuntimeError("Reference file exceeds max_reference_bytes")
                             stream.write(chunk)
                     await sandbox.upload(local, f"{INPUT_DIR}/{name}")
                 finally:
