@@ -753,3 +753,35 @@ class TestConfigYaml:
             agent.base_url_for_run("http://model", {"_ng_task_index": 0, "_ng_rollout_index": 0})
             == f"http://model/ng-rollout/0-0{capture_path}"
         )
+
+
+@pytest.mark.parametrize(
+    "exit_code,status", [(0, "completed"), (7, "failed"), (-15, "failed"), (None, "unknown"), (True, "unknown")]
+)
+def test_bash_exit_code_is_execution_outcome(tmp_path: Path, exit_code: int | None, status: str) -> None:
+    db = _session_db(
+        tmp_path,
+        [
+            (
+                "assistant",
+                [
+                    {
+                        "type": "tool",
+                        "callID": "shell",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "exit 7"},
+                            "output": "stdout",
+                            "metadata": {"exit": exit_code},
+                        },
+                    }
+                ],
+            )
+        ],
+    )
+    bundle = _parse_opencode_session(db, "fallback")
+    tool = _tool_calls(bundle)[0]
+    assert tool.status == status
+    assert tool.error_type == ("tool_error" if status == "failed" else None)
+    assert any(gap.code == "tool_outcome_unavailable" for gap in bundle.gaps) == (status == "unknown")
