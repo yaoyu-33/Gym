@@ -805,7 +805,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 cleanup_confirmed=state.session.cleanup_confirmed,
             )
         return AgentCloseSessionResponse(
-            agent_session_id=state.request.agent_session_id, agent_observations=observations
+            agent_session_id=state.request.agent_session_id,
+            agent_observations=observations,
+            trajectory=state.trajectory,
         )
 
     def _session_input(self, body: NeMoGymResponseCreateParamsNonStreaming) -> tuple[str, str]:

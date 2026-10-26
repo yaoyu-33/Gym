@@ -18,8 +18,11 @@ from pydantic import ValidationError
 
 from nemo_gym.agent_utils.supervisor_client import parse_cleanup_receipt
 from nemo_gym.base_responses_api_agent import AgentCloseSessionRequest, AgentSeedSessionRequest
+from nemo_gym.base_responses_api_model import CaptureStore
 from nemo_gym.episode_types import EpisodeId, TaskId
+from nemo_gym.observability.model_calls import merge_model_call_capture_into_record
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.rollout_collection import _build_trajectory_record
 from nemo_gym.server_utils import ServerClient
 from nemo_gym.tasks.harbor.materialize import materialize_task
 from nemo_gym.tasks.harbor.task import load_task
@@ -272,6 +275,71 @@ def capture_observations(sandbox, tmp_path):
 
     sandbox.download = download
     return database
+
+
+def test_session_close_preserves_database_turns_and_captured_call_identity(setup, tmp_path):
+    agent, sandbox = setup
+    export = json.loads(sandbox.events)
+    assistant = export["messages"][1]
+    assistant["parts"].insert(0, {"type": "step-start"})
+    assistant["parts"].append({"type": "step-finish"})
+    assistant["parts"][2]["state"].update(status="completed", metadata={"exit": 0}, time={"start": 1, "end": 2})
+    sandbox.events = json.dumps(export)
+    capture_observations(sandbox, tmp_path)
+
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
+        assert created.status_code == 200, created.text
+        response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
+        assert response.status_code == 200, response.text
+        closed = client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
+        assert closed.status_code == 200, closed.text
+
+    trajectory = closed.json()["trajectory"]
+    assert trajectory is not None
+    assert (trajectory["task_id"], trajectory["rollout_id"]) == ("task", "opencode-smoke-a2")
+    [turn] = trajectory["turns"]
+    assert (turn["invocation_id"], turn["source_message_id"]) == ("root", "message-1")
+    assert turn["source_model_ref"] == agent.config.model_server.model_dump()
+    assert turn["step_count"] == 1
+    assert turn["reasoning_content"][0]["text"] == "Inspect"
+    assert turn["answer"][0]["content"][0]["text"] == "Fixed"
+    assert turn["answer"][1]["call_id"] == "tool-1"
+
+    store = CaptureStore(tmp_path / "capture")
+    for call_id, status in [("retry", 503), ("success", 200)]:
+        store.record(
+            "opencode-smoke-a2",
+            {
+                "model_call_id": call_id,
+                "client_session_id": "root",
+                "client_assistant_message_id": "message-1",
+                "model_ref": agent.config.model_server.model_dump(),
+                "dialect": "responses",
+                "status_code": status,
+                "request": {"input": "task"},
+                "response": {"id": "response-success", "status": "completed", "output": []} if status == 200 else None,
+                "error_category": "upstream_error" if status == 503 else None,
+            },
+        )
+    record = {
+        "_ng_task_index": 0,
+        "_ng_rollout_index": 0,
+        "_ng_rollout_id": "opencode-smoke-a2",
+        "task_id": "task",
+        "ng_agent_observations": closed.json()["agent_observations"],
+        "ng_trajectory": trajectory,
+    }
+    merge_model_call_capture_into_record(record, [store.root], include_payloads=True)
+    canonical = _build_trajectory_record(record, record)
+    [turn] = canonical.turns
+    assert turn.source_message_id == "message-1"
+    assert [call.model_call_id for call in turn.model_calls] == ["retry", "success"]
+    assert not any(gap.code.startswith("assistant_message_call_") for gap in canonical.gaps)
+    [tool] = canonical.tool_calls
+    assert (tool.tool_call_id, tool.status, tool.output) == ("tool-1", "completed", "/app")
+    sandbox.disconnect.assert_awaited_once()
+    sandbox.stop.assert_not_awaited()
 
 
 @pytest.mark.parametrize("output_budget", [4096, 32000])
