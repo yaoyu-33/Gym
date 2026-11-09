@@ -170,15 +170,21 @@ response and the reported conversation.
 
 ### Outcomes
 
+The adapter reads the supervisor's receipt, the runner's `output.json` and mini-SWE's trajectory into a
+`RunEvidence`, and Gym's shared outcome ladder (`finish_response`) sets the status, `ng_agent_outcome` and
+`ng_agent_stop_reason`. Every outcome below answers HTTP 200 unless it says otherwise.
+
 | mini-SWE ended with | Response | Verified |
 | --- | --- | --- |
 | `Submitted` | `completed` | Yes |
 | `LimitsExceeded`, `TimeExceeded`, a context-window error, Gym's deadline after a model call returned, or a rollout stop | `incomplete`; `mini_swe_termination` names it | Yes |
 | Gym's deadline before any model call returned | `failed`, `AgentDeadline`, with `ng_agent_outcome` `unknown`; no model transport cause is inferred | By the outcome policy, which retries it by default |
-| No exit status: the run was killed mid-step, by its own command or an OOM kill. The runner saves before each step's commands run, so the step's model call is kept. | `incomplete`, `killed` | Yes |
 | No exit status: close stopped the run | `incomplete`, `cancelled` | No: a closed episode is not verified |
-| A model call that failed (LiteLLM's error, such as `RateLimitError`) or `RepeatedFormatError` | `failed` with `ng_agent_outcome` | By the Environment Server's outcome policy |
-| No trajectory (the runner died before its first model call returned), a required MCP server that did not connect, or another exception | HTTP 500, retryable | No |
+| A model call that failed (LiteLLM's error, such as `RateLimitError`) or `RepeatedFormatError` | `failed` with `ng_agent_outcome`; a 4xx other than 408, 425 and 429 before any model reply is `model_request_rejected` | By the Environment Server's outcome policy |
+| Another exception mini-SWE recorded as its exit status | `failed` with `ng_agent_outcome` `unknown` | By the outcome policy, which retries it by default |
+| No usable result: no exit status because the run was killed mid-step (by its own command or an OOM kill the provider did not confirm), no trajectory (the runner died before its first model call returned), or a saved model response that is not a Responses API object | `failed` with `ng_agent_outcome` `agent_run_error` | By the outcome policy, which retries it by default |
+| A required MCP server that did not connect | HTTP 500, retryable | No |
+| The provider's wait for the supervisor expired | Answered as the run's deadline when the supervisor's receipt confirms that the deadline ended the harness, with the late provider recorded as an observed failure; otherwise a typed HTTP 500 (`provider_command_outcome_unknown`), retryable | As the row it falls in |
 
 Each model call may take the whole run's budget, so a first call slower than the whole budget is retried rather than
 graded. Usage is reported only when every model call, including responses mini-SWE rejected for their format, has a

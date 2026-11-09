@@ -24,7 +24,7 @@ from nemo_gym.agents import (
     SandboxPythonRuntime,
     SandboxSession,
 )
-from nemo_gym.core import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.core import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming, NgFailureEvent
 from nemo_gym.sandbox import read_text, upload_text
 from nemo_gym.trajectory import AgentObservationBundle
 
@@ -111,6 +111,8 @@ class MiniSWESession(AgentSessionState):
     activation_request: NeMoGymResponseCreateParamsNonStreaming | None = None
     task: asyncio.Task[NeMoGymResponse] | None = None
     runtime_info: HarnessProcessInfo | None = None
+    # The provider's wait for the supervisor expired after the run's deadline ended the harness; close replays it.
+    provider_wait_failure: NgFailureEvent | None = None
 
     async def install(self, *, timeout: float) -> None:
         """Reuse or install the pinned runtime, then stage the runner and the MCP CLI in the session directory.

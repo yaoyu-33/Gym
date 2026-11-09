@@ -39,6 +39,7 @@ import yaml
 from fastapi import HTTPException, Request
 from minisweagent.config import builtin_config_dir, get_config_path
 from minisweagent.run.extra.swegym_runner import _main as run_swegym
+from openai.types.responses import ResponseError
 from pydantic import ConfigDict, Field, JsonValue
 
 from nemo_gym.agents import (
@@ -51,6 +52,7 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     assert_model_url_reachable_from_sandbox,
@@ -64,14 +66,16 @@ from nemo_gym.config import (
 )
 from nemo_gym.core import (
     AGENT_INVALID_OUTPUT,
-    MODEL_CONTEXT_LIMIT,
     MODEL_REQUEST_ERROR,
     MODEL_TRANSPORT_ERROR,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NgFailureEvent,
+    agent_route_failure,
     observe_failure,
+    sdk_error_details,
 )
+from nemo_gym.core.failure_kinds import PROVIDER_COMMAND_OUTCOME_UNKNOWN
 from nemo_gym.sandbox import (
     AsyncSandbox,
     DirectSandboxConnection,
@@ -80,6 +84,7 @@ from nemo_gym.sandbox import (
     resolve_provider_config,
     resolve_provider_metadata,
 )
+from nemo_gym.sandbox.failures import sandbox_failure
 from nemo_gym.server_runtime import (
     BaseRunRequest,
     BaseVerifyRequest,
@@ -233,10 +238,11 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
         return True
 
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
-        """Read the exit status mini-SWE 2.4.6 records when a model call fails; tested on that release."""
+        """Read the exit status mini-SWE 2.4.6 records when a model call fails; tested on that release.
+
+        A context overflow (``_context_overflow``) is ``RunEvidence.context_limit``, never a classified failure.
+        """
         exit_status = native_result.get("exit_status")
-        if _context_overflow(exit_status, str(native_result.get("error") or "")):
-            return AgentOutcome(failure_kind=MODEL_CONTEXT_LIMIT)
         if exit_status in MODEL_ERROR_STATUS_CODES:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=MODEL_ERROR_STATUS_CODES[exit_status])
         if exit_status in MODEL_TRANSPORT_EXIT_STATUSES:
@@ -413,6 +419,8 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
     async def _close_agent_session_state(self, state: AgentSessionState) -> AgentCloseSessionResponse:
         if not isinstance(state, MiniSWESession):
             raise TypeError("Expected a mini-SWE agent session state")
+        if state.provider_wait_failure is not None:
+            observe_failure(state.provider_wait_failure)
         await state.close(self.config.session_close_timeout_seconds)
         # A run that was stopped or failed before its response was built still left its artifacts.
         if state.observations is None and state.session.artifacts is not None:
@@ -573,17 +581,56 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
             gaps=gaps,
         )
 
+    @staticmethod
+    def _after_provider_wait_expired(state: MiniSWESession, error: TimeoutError) -> MiniSWEArtifacts:
+        """The run's artifacts when the provider's wait for the supervisor's report expired.
+
+        ``SandboxSession`` then stops the harness itself and collects its files. When the receipt confirms that the
+        run's deadline ended the harness, the model had its whole budget: the run is answered as any deadline, and
+        the late provider is recorded as an observed failure, not as ``RunEvidence.infra_fault`` (a fault that cost
+        the run its time). Otherwise how the run ended is unknown, a lifecycle failure: the provider's command
+        outcome is unknown, raised as a typed failure the agent route only routes (HTTP 500, retried).
+        """
+        cleanup, artifacts = state.session.cleanup, state.session.artifacts
+        if cleanup is not None and cleanup["cleanup_confirmed"] and cleanup["timed_out"] and artifacts is not None:
+            state.provider_wait_failure = NgFailureEvent(
+                boundary="sandbox",
+                failure_kind="transport_timeout",
+                failure_reason="Sandbox provider wait expired after mini-SWE's supervisor recorded its deadline",
+                operation="exec_wait",
+                stage="agent",
+                foreign_error=sdk_error_details(error, message=str(error)),
+            )
+            state.provider_wait_failure.__cause__ = error
+            observe_failure(state.provider_wait_failure)
+            return artifacts
+        if not state.session.launch_started:
+            raise error
+        provider_failure = sandbox_failure(
+            operation="exec",
+            failure_kind=PROVIDER_COMMAND_OUTCOME_UNKNOWN,
+            cause=error,
+            reason="The provider's wait for mini-SWE's supervisor expired before it reported how the run ended",
+            provider=state.provider_name,
+            sandbox_id=state.sandbox_id,
+        )
+        provider_failure.__cause__ = error
+        raise agent_route_failure(provider_failure, operation="mini_swe.execute", stage="agent") from provider_failure
+
     async def _activate(self, state: MiniSWESession, body: NeMoGymResponseCreateParamsNonStreaming) -> NeMoGymResponse:
         timeout = self._agent_timeout_sec(state, body)
         async with self.sem:
-            artifacts = await state.session.execute(
-                stage_activation=lambda: state.stage_activation(
-                    self._activation_payload(state, body, timeout=timeout)
-                ),
-                collect=state.collect,
-                timeout=timeout,
-                close_timeout=self.config.session_close_timeout_seconds,
-            )
+            try:
+                artifacts = await state.session.execute(
+                    stage_activation=lambda: state.stage_activation(
+                        self._activation_payload(state, body, timeout=timeout)
+                    ),
+                    collect=state.collect,
+                    timeout=timeout,
+                    close_timeout=self.config.session_close_timeout_seconds,
+                )
+            except TimeoutError as error:
+                artifacts = self._after_provider_wait_expired(state, error)
         cleanup = state.session.cleanup
         if cleanup is None or not cleanup["cleanup_confirmed"]:
             raise RuntimeError("mini-SWE ended without confirmed supervisor cleanup")
@@ -601,35 +648,42 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
             raise RuntimeError(
                 f"mini-SWE task MCP servers are unavailable: {(output.get('error') or {}).get('message')}"
             )
-        if artifacts.trajectory is None and not (timed_out or cancelled):
-            raise RuntimeError(f"mini-SWE saved no trajectory: {output.get('error') or artifacts.log[-2000:]}")
-
         projection = project(artifacts.trajectory, artifacts.mcp_calls)
-        if projection.invalid_response:
-            raise RuntimeError("mini-SWE saved a model response that is not a valid Responses API object")
-        native_result = {"exit_status": exit_status, "error": error}
-        failed = False
-        if timed_out and not projection.responses and not state.session.expired:
-            # The supervisor proves the deadline, not whether a model request started or failed in transport.
-            # Keep the retryable failed result without inventing mini-SWE's native model Timeout exception.
-            exit_status, error = "AgentDeadline", "no model call returned before the run's deadline"
-            native_result = {"exit_status": exit_status, "error": error}
-            termination, status, failed = exit_status, "failed", True
-        elif timed_out:
-            termination, status = "timeout", "incomplete"
-        elif exit_status == "Submitted":
-            termination, status = "completed", "completed"
-        elif _context_overflow(exit_status, error) or exit_status in LIMIT_EXIT_STATUSES:
-            termination, status = exit_status, "incomplete"
+        context_limit = _context_overflow(exit_status, error)
+        # mini-SWE records an exit status whenever its loop ends, even on an exception, so a run without one was
+        # stopped (deadline or close) or killed mid-step: by the agent's own command, or by an OOM kill.
+        ended_on_error = exit_status not in (None, "Submitted", *LIMIT_EXIT_STATUSES) and not context_limit
+        evidence = RunEvidence(
+            # A missing or unreadable transcript is no usable result, as is a run killed mid-step.
+            has_result=exit_status == "Submitted" and not projection.invalid_response,
+            timed_out=timed_out,
+            # mini-SWE saves the transcript after each model reply.
+            model_replied=bool(projection.responses),
+            stopped=cancelled and exit_status is None,
+            context_limit=context_limit,
+            model_limit="turns" if exit_status in LIMIT_EXIT_STATUSES and not context_limit else None,
+            error=self.classify_outcome({"exit_status": exit_status, "error": error}) if ended_on_error else None,
+            # The supervisor proves the deadline, not whether a model request started or failed in transport, so a
+            # deadline before any model reply stays retried until model calls carry their failures to capture.
+            retry_deadline_before_reply=True,
+        )
+        if timed_out:
+            termination = "timeout" if projection.responses or state.session.expired else "AgentDeadline"
         elif exit_status is None:
-            # mini-SWE records an exit status whenever its loop ends, even on an exception, so a saved trajectory
-            # without one means the run was stopped by close or killed mid-step: by the agent's own command, or by an
-            # OOM kill.
-            termination, status = "cancelled" if cancelled else "killed", "incomplete"
-        elif self.classify_outcome(native_result).failure_kind != "unknown":
-            termination, status, failed = exit_status, "failed", True
+            termination = (
+                "cancelled" if cancelled else "killed" if artifacts.trajectory is not None else "no_trajectory"
+            )
         else:
-            raise RuntimeError(f"mini-SWE stopped with {exit_status}: {error[:2000]}")
+            termination = "completed" if exit_status == "Submitted" else exit_status
+        # What the run ended on, for a response the ladder fails.
+        if ended_on_error:
+            failure_message = f"{exit_status}: {error[:2000]}"
+        elif artifacts.trajectory is None:
+            failure_message = f"mini-SWE saved no trajectory: {output.get('error') or artifacts.log[-2000:]}"
+        elif projection.invalid_response:
+            failure_message = "mini-SWE saved a model response that is not a valid Responses API object"
+        else:
+            failure_message = f"mini-SWE was killed mid-step (exit {cleanup['return_code']})"
 
         response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
@@ -638,8 +692,8 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
             object="response",
             output=projection.output(),
             usage=projection.usage,
-            status=status,
-            error={"code": "server_error", "message": f"{exit_status}: {error[:2000]}"} if failed else None,
+            # Replaced by finish_response.
+            status="completed",
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -656,15 +710,17 @@ class MiniSWEAgent(SimpleResponsesAPIAgent):
                 ),
             },
         )
+        response = self.finish_response(response, evidence, session=state.session)
+        if response.status == "failed" and not timed_out:
+            response = response.model_copy(
+                update={"error": ResponseError(code="server_error", message=failure_message)}
+            )
         # A run that ended on its own before close stopped it keeps its own outcome.
-        stopped = "timeout" if timed_out else "cancelled" if cancelled and exit_status is None else None
-        state.observations = self._observations(
-            state, artifacts, stopped=stopped, status="failed" if failed else status
-        )
+        stopped = "timeout" if timed_out else "cancelled" if evidence.stopped else None
+        state.observations = self._observations(state, artifacts, stopped=stopped, status=response.status)
         if projection.usage is None and projection.responses:
             state.observations.gaps.append(ObservationGap(code="usage_unavailable"))
-        response = self.report_rollout_stop(response, state.session)
-        return self.report_outcome(response, native_result)
+        return response
 
     async def responses(
         self,

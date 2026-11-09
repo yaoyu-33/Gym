@@ -663,11 +663,13 @@ async def test_a_deadline_without_a_model_reply_keeps_its_cause_unknown(agent, t
 
     response = await asyncio.wait_for(agent._activate(state, body()), timeout=5)
 
-    # This also covers a runner stalled during startup, before making any model request.
+    # This also covers a runner stalled during startup, before making any model request. The outcome ladder keeps
+    # this retried (retry_deadline_before_reply) until every model call carries its failure to capture.
     assert (response.status, response.metadata["mini_swe_termination"]) == ("failed", "AgentDeadline")
     assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "unknown"}
+    assert response.metadata["ng_agent_stop_reason"] == "timeout"
     assert response.metadata["stop_reason"] == "wall_time"
-    assert "no model call returned" in response.error.message
+    assert "before any model reply" in response.error.message
     invocation = state.observations.records[0]
     assert (invocation.status, invocation.stop_reason) == ("failed", "wall_time")
 
@@ -710,17 +712,22 @@ async def test_usage_stays_unknown_on_the_response_when_one_call_reported_none(a
     assert "usage_unavailable" in [gap.code for gap in state.observations.gaps]
 
 
-async def test_a_saved_response_that_is_not_a_responses_object_is_retryable(agent) -> None:
+async def test_a_saved_response_that_is_not_a_responses_object_is_no_usable_result(agent) -> None:
     trajectory = native_trajectory()
     trajectory["messages"][5]["output"] = "not a list"
     state = state_for(agent)
     finish_run(state, trajectory=trajectory)
 
-    with pytest.raises(RuntimeError, match="not a valid Responses API object"):
-        await asyncio.wait_for(agent._activate(state, body()), timeout=5)
+    response = await asyncio.wait_for(agent._activate(state, body()), timeout=5)
+
+    # An HTTP 500 before the outcome ladder; still retried by default, now with its partial output.
+    assert response.status == "failed"
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+    assert "not a valid Responses API object" in response.error.message
+    assert state.observations.records[0].status == "failed"
 
 
-async def test_a_run_killed_mid_step_is_the_agents_own_result(agent) -> None:
+async def test_a_run_killed_mid_step_is_no_usable_result(agent) -> None:
     trajectory = native_trajectory()
     trajectory["info"]["exit_status"] = ""
     state = state_for(agent)
@@ -728,7 +735,11 @@ async def test_a_run_killed_mid_step_is_the_agents_own_result(agent) -> None:
 
     response = await agent._activate(state, body())
 
-    assert (response.status, response.metadata["mini_swe_termination"]) == ("incomplete", "killed")
+    # The outcome ladder (team decision 5): a run that never ended its loop is no usable result, retried by default.
+    # It was a graded incomplete response before the ladder.
+    assert (response.status, response.metadata["mini_swe_termination"]) == ("failed", "killed")
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+    assert response.error.message == "mini-SWE was killed mid-step (exit 137)"
 
 
 async def test_a_run_close_stopped_is_cancelled_when_its_activation_returns_before_close_cancels_it(agent) -> None:
@@ -799,25 +810,39 @@ async def test_a_reported_model_failure_is_classified_for_the_environment(
     assert state.observations.records[0].status == "failed"
 
 
+async def test_unavailable_task_mcp_servers_raise_for_a_retry(agent) -> None:
+    state = state_for(agent)
+    output = {"error": {"type": "mcp_unavailable", "message": "Required MCP servers did not connect: t"}}
+    finish_run(state, trajectory=None, return_code=3, output=output)
+
+    with pytest.raises(RuntimeError, match="MCP"):
+        await agent._activate(state, body())
+
+
 @pytest.mark.parametrize(
-    ("trajectory", "return_code", "output", "match"),
+    ("trajectory", "outcome", "message"),
     [
-        (None, 1, {"error": {"type": "ImportError", "message": "no litellm"}}, "saved no trajectory"),
-        (None, 3, {"error": {"type": "mcp_unavailable", "message": "Required MCP servers did not connect: t"}}, "MCP"),
-        ("unknown", 1, {}, "stopped with ValueError"),
+        # The runner died before mini-SWE saved anything: no usable result.
+        (None, "agent_run_error", "saved no trajectory"),
+        # An exception mini-SWE recorded that is not a model failure: its cause is unknown.
+        ("ValueError", "unknown", "ValueError: "),
     ],
 )
-async def test_failures_that_are_not_the_agents_raise_for_a_retry(
-    agent, trajectory, return_code, output, match
+async def test_failures_that_are_not_the_agents_answer_200_and_are_retried(
+    agent, trajectory, outcome, message
 ) -> None:
-    if trajectory == "unknown":
-        trajectory = native_trajectory()
-        trajectory["info"]["exit_status"] = "ValueError"
+    if trajectory is not None:
+        exit_status, trajectory = trajectory, native_trajectory()
+        trajectory["info"]["exit_status"] = exit_status
     state = state_for(agent)
-    finish_run(state, trajectory=trajectory, return_code=return_code, output=output)
+    finish_run(state, trajectory=trajectory, return_code=1, output={"error": {"type": "ImportError"}})
 
-    with pytest.raises(RuntimeError, match=match):
-        await agent._activate(state, body())
+    response = await agent._activate(state, body())
+
+    # Each was an HTTP 500 before the outcome ladder; the default outcome policy still retries it.
+    assert response.status == "failed"
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": outcome}
+    assert message in response.error.message
 
 
 async def test_unconfirmed_cleanup_is_never_a_gradable_response(agent) -> None:
@@ -862,6 +887,156 @@ async def test_mcp_call_records_left_out_are_a_declared_gap(agent) -> None:
     assert (gap.invocation_id, gap.detail) == ("rollout", "2")
 
 
+# -- the outcome ladder ----------------------------------------------------------------------------------------------
+
+
+def _ended_with(exit_status: str, error: str = "", *, replied: bool = True) -> dict:
+    """mini-SWE's trajectory of a run that ended with ``exit_status``, after its model replies or before any."""
+    trajectory = native_trajectory()
+    trajectory["info"]["exit_status"] = exit_status
+    ending = {"role": "exit", "content": error, "extra": {"exit_status": exit_status, "exception_str": error}}
+    if replied:
+        trajectory["messages"][-1] = ending
+    else:
+        trajectory["messages"] = [*trajectory["messages"][:2], ending]
+    return trajectory
+
+
+@pytest.mark.parametrize(
+    ("trajectory", "run", "evidence"),
+    [
+        (native_trajectory(), {}, {"has_result": True, "model_replied": True}),
+        (_ended_with("LimitsExceeded"), {}, {"model_replied": True, "model_limit": "turns"}),
+        (_ended_with("ContextWindowExceededError"), {}, {"model_replied": True, "context_limit": True}),
+        (
+            _ended_with("AuthenticationError", "litellm.AuthenticationError: 401", replied=False),
+            {"return_code": 1},
+            {"model_replied": False, "error": {"failure_kind": "model_request_error", "status_code": 401}},
+        ),
+        (None, {"return_code": 143, "timed_out": True}, {"timed_out": True, "model_replied": False}),
+        (None, {"return_code": 1}, {"model_replied": False}),
+    ],
+    ids=["submitted", "step-limit", "context-window", "401-before-reply", "deadline-before-save", "no-trajectory"],
+)
+async def test_the_run_reads_into_run_evidence(agent, monkeypatch, trajectory, run, evidence) -> None:
+    captured = []
+    finish = MiniSWEAgent.finish_response
+
+    def spy(self, response, run_evidence, *, session=None):
+        captured.append(run_evidence)
+        return finish(self, response, run_evidence, session=session)
+
+    monkeypatch.setattr(MiniSWEAgent, "finish_response", spy)
+    state = state_for(agent)
+    finish_run(state, trajectory=trajectory, **run)
+
+    await agent._activate(state, body())
+
+    [observed] = captured
+    evidence = dict(evidence)
+    error = evidence.pop("error", None)
+    expected = {
+        "has_result": False,
+        "timed_out": False,
+        "stopped": False,
+        "context_limit": False,
+        "model_limit": None,
+        "retry_deadline_before_reply": True,
+        **evidence,
+    }
+    assert {name: getattr(observed, name) for name in expected} == expected
+    assert (observed.error.model_dump(exclude_none=True) if observed.error else None) == error
+    assert observed.infra_fault is None
+
+
+@pytest.mark.parametrize("exit_status, status", [("BadRequestError", 400), ("AuthenticationError", 401)])
+async def test_a_model_request_rejected_before_any_reply_is_neither_graded_nor_retried(
+    agent, exit_status, status
+) -> None:
+    state = state_for(agent)
+    finish_run(
+        state, trajectory=_ended_with(exit_status, f"litellm.{exit_status}: {status}", replied=False), return_code=1
+    )
+
+    response = await agent._activate(state, body())
+
+    # Before the outcome ladder: model_request_error with the status (400 graded, 401 failed).
+    assert response.status == "failed"
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "model_request_rejected"}
+    assert response.error.message.startswith(f"{exit_status}: ")
+
+
+def _provider_wait_expires(state: MiniSWESession, *, trajectory: dict | None, deadline_confirmed: bool) -> None:
+    """Make execute raise as SandboxSession does when the provider's wait for the supervisor expired, after it
+    stopped the harness and collected its files itself."""
+    execute = finish_run(state, trajectory=trajectory, return_code=143, timed_out=deadline_confirmed)
+    inner = execute.side_effect
+
+    async def expired(**kwargs):
+        await inner(**kwargs)
+        raise TimeoutError("mini-SWE sandbox supervisor exceeded its execution deadline")
+
+    execute.side_effect = expired
+
+
+@pytest.mark.parametrize(
+    ("trajectory", "status"),
+    [(_ended_with("", replied=True), "incomplete"), (None, "failed")],
+    ids=["after-a-reply", "before-any-reply"],
+)
+async def test_a_provider_wait_that_expired_after_the_confirmed_deadline_is_the_runs_deadline(
+    agent, trajectory, status
+) -> None:
+    from nemo_gym.core import RequestFailureLog
+
+    state = state_for(agent)
+    _provider_wait_expires(state, trajectory=trajectory, deadline_confirmed=True)
+
+    with RequestFailureLog.capture() as activation_log:
+        response = await agent._activate(state, body())
+    saved = activation_log.reply_report(None)
+
+    # An HTTP 500 before the outcome ladder. A deadline before any reply stays retried (failed, unknown).
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == (status, "timeout")
+    observed = saved.events[state.provider_wait_failure.event_id]
+    assert (observed.boundary, observed.failure_kind, observed.operation) == (
+        "sandbox",
+        "transport_timeout",
+        "exec_wait",
+    )
+    assert saved.failure_id is None
+    state.session.close = AsyncMock()
+    with RequestFailureLog.capture() as close_log:
+        await agent._close_agent_session_state(state)
+    assert close_log.reply_report(None).events[observed.event_id] == observed
+
+
+async def test_a_provider_wait_that_expired_without_a_confirmed_deadline_is_a_typed_lifecycle_failure(agent) -> None:
+    from nemo_gym.core import NgFailureEvent
+
+    state = state_for(agent)
+    _provider_wait_expires(state, trajectory=_ended_with("", replied=True), deadline_confirmed=False)
+
+    with pytest.raises(NgFailureEvent) as raised:
+        await agent._activate(state, body())
+
+    route = raised.value
+    assert (route.boundary, route.failure_kind, route.operation, route.stage) == (
+        "agent",
+        "agent_route_failed",
+        "mini_swe.execute",
+        "agent",
+    )
+    provider = route.__cause__
+    assert (provider.boundary, provider.failure_kind, provider.operation) == (
+        "sandbox",
+        "provider_command_outcome_unknown",
+        "exec",
+    )
+    assert (provider.details.provider, provider.details.sandbox_id) == ("sandbox", "task-box")
+    assert isinstance(provider.__cause__, TimeoutError)
+
+
 # -- close -----------------------------------------------------------------------------------------------------------
 
 
@@ -881,9 +1056,8 @@ async def test_close_returns_the_activation_observations_and_cleanup(agent) -> N
 
 async def test_close_after_a_failed_activation_reports_its_partial_run(agent) -> None:
     state = state_for(agent)
-    trajectory = native_trajectory()
-    trajectory["info"]["exit_status"] = "ValueError"
-    finish_run(state, trajectory=trajectory, return_code=1)
+    # Unavailable task MCP servers fail the activation itself.
+    finish_run(state, trajectory=native_trajectory(), return_code=3)
     state.task = asyncio.create_task(agent._activate(state, body()))
     with pytest.raises(RuntimeError):
         await asyncio.wait_for(state.task, timeout=5)
