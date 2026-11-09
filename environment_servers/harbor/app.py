@@ -95,7 +95,7 @@ from nemo_gym.agents import (
     AgentSeedSessionResponse,
     AgentSessionCapabilitiesResponse,
     OutcomeAction,
-    agent_outcome_policy,
+    agent_response_action,
 )
 from nemo_gym.client import get_response_json, raise_boundary_failure, raise_for_status
 from nemo_gym.config import (
@@ -1353,17 +1353,22 @@ class HarborEnvironmentServer(
         """A failed response whose harness classified the cause is routed by the deployment's policy before any
         grading: a transport or unknown cause is retried ungraded, as on ``single_agent_turn``, instead of
         handing test.sh a half-finished sandbox and recording a real 0. In a multi-step task this ends the
-        episode at the turn that failed; a verify cause is graded as before."""
-        action = agent_outcome_policy(agent_response, config=self.config.agent_outcome_policy)
+        episode at the turn that failed; a verify cause is graded as before.
+
+        As on ``single_agent_turn`` (``agent_response_action``), a ``failure_report`` that selects a failure not
+        matching the response's outcome fails the episode, and the selected failure is the episode failure's cause,
+        so the failure row keeps its kind."""
+        action, cause = agent_response_action(agent_response, config=self.config.agent_outcome_policy)
         if action != OutcomeAction.VERIFY:
             raise self._failure(
                 stage="agent",
                 failure_reason=agent_response.error.message if agent_response.error else "Agent reported failure",
                 terminal=action == OutcomeAction.FAIL,
+                failure_kind=cause.failure_kind if cause else None,
                 partial_response=agent_response,
                 agent_observations=handle.observations,
                 trajectory=handle.trajectory,
-            )
+            ) from cause
 
     async def _require_turn_continuation(self) -> None:
         """Refuse a ``turn_sessions: continue`` run before any sandbox when the harness cannot continue a session.
@@ -1994,6 +1999,10 @@ class HarborEnvironmentServer(
             # Compose group the adapter already created the /logs paths main bound, before its command; this mkdir
             # is idempotent there and still makes the whole tree.
             session.workdir = await self._prepare_workdir(sandbox, task, task.workdir)
+            # The task's skills are in place before its entrypoint, healthcheck and agent, as a Dockerfile `COPY`
+            # would leave them. A Compose group's main was already started by the adapter (command and image
+            # healthcheck included), so there they reach the agent only.
+            await self._upload_task_skills(sandbox, task, session.workdir)
             # A Compose group's main was started by the adapter, its entrypoint run and its image healthcheck waited.
             managed = compose is not None
             launch = session.entrypoint = await self._start_entrypoint(
@@ -2004,7 +2013,7 @@ class HarborEnvironmentServer(
             await self._wait_healthy(
                 sandbox, task, launch, user=image_user, workdir=session.workdir, compose_managed=managed
             )
-            await self._write_task_context(sandbox, task)
+            await self._write_task_context(sandbox, task, session.workdir)
             if launch is not None:
                 # The last look before the hand-over: an entrypoint that died during the seed's remaining steps
                 # (a setup script failing after its first lines) is a seed failure, not a rollout on an empty task.
