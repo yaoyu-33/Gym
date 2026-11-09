@@ -587,3 +587,202 @@ async def test_owned_start_failure_retains_cleanup_handle_and_metadata(monkeypat
     assert spec.metadata["gym-agent"] == "deepagents"
     assert spec.ttl_s > 0
     provider.aclose.assert_not_awaited()
+
+
+# --- the outcome ladder: the runner's report -> RunEvidence -> the response --------------------------------
+
+_CONTEXT_BODY = {"error": {"code": "context_length_exceeded", "message": "limit"}}
+
+
+def _runner_payload(model: ModelServer, workdir: Path) -> dict:
+    from langchain_core.messages import HumanMessage, messages_to_dict
+
+    return {
+        "messages": messages_to_dict([HumanMessage(content="Do the task.")]),
+        "model_url": f"{model.base_url}/responses",
+        "request_defaults": {},
+        "max_input_tokens": 100_000,
+        "system_prompt": None,
+        "shell_timeout_seconds": 30,
+        "workdir": str(workdir),
+        "task_env": {},
+        "rollout_id": "rollout",
+        "stop_request_path": str(workdir / "stop.request"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("answers", "evidence"),
+    [
+        ([[text("done")]], app.RunEvidence(has_result=True, timed_out=False, model_replied=True)),
+        (
+            [401],
+            app.RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=False,
+                error=app.AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=401),
+            ),
+        ),
+        (
+            [[call("ls", {"path": "/"}, "c1")], 400],
+            app.RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=True,
+                error=app.AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=400),
+            ),
+        ),
+        (
+            [(400, _CONTEXT_BODY)],
+            app.RunEvidence(has_result=False, timed_out=False, model_replied=False, context_limit=True),
+        ),
+        (
+            "unreachable",
+            app.RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=False,
+                error=app.AgentOutcome(failure_kind=MODEL_TRANSPORT_ERROR),
+            ),
+        ),
+    ],
+)
+async def test_the_runners_report_reads_into_run_evidence(tmp_path, monkeypatch, answers, evidence):
+    from responses_api_agents.langchain_deepagents_agent import sandbox_runner
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sandbox_runner, "_retry_delay", lambda retry_after, attempt: 0)
+    model = ModelServer([] if answers == "unreachable" else answers)
+    if answers == "unreachable":
+        model.close()
+    try:
+        output = await sandbox_runner.run(_runner_payload(model, tmp_path), tmp_path)
+    finally:
+        model.close()
+
+    assert _agent()._run_evidence(output, expired=False) == evidence
+
+
+def _report(**fields) -> dict:
+    """A runner report as ``sandbox_runner.run`` writes it, with ``fields`` setting how the run ended."""
+    return {
+        "status": "completed",
+        "stop_reason": None,
+        "model_error": None,
+        "messages": [],
+        "model_calls": 0,
+        "usages": [],
+        "usage_incomplete": False,
+        **fields,
+    }
+
+
+def _failed(status: int | None = None, *, replies: int = 0, **fields) -> dict:
+    """A run that ended on a model call that failed with ``status`` (or as ``fields`` say), after ``replies``."""
+    if status is not None:
+        fields.update(model_error_status=status, model_context_limit=False)
+    return _report(
+        status="failed",
+        model_error=f"Model Server HTTP {status}" if status else "ClientConnectorError: refused",
+        model_calls=replies + 1,
+        usages=[USAGE] * replies,
+        **fields,
+    )
+
+
+_RUNNER_FAILED = {"status": "failed", "error": "exited without output", "traceback": "Killed"}
+
+
+def _sandbox_state(report: dict, *, expired: bool = False):
+    from responses_api_agents.langchain_deepagents_agent.sandbox import DeepAgentsSandboxSession
+
+    session = SimpleNamespace(
+        artifacts=report,
+        workdir="/app",
+        stop_request_path="/tmp/stop.request",
+        expired=expired,
+        expire_reason="budget" if expired else None,
+        execution_oom=None,
+        sandbox_stopped=False,
+        cleanup_confirmed=True,
+    )
+    return DeepAgentsSandboxSession(request=_seed(sandbox_access=_access()), session=session)
+
+
+@pytest.mark.parametrize(
+    ("report", "status", "stop_reason", "outcome"),
+    [
+        # a: an explicit context-limit rejection
+        (
+            _report(
+                status="incomplete", stop_reason="context_limit", model_error_status=400, model_context_limit=True
+            ),
+            "incomplete",
+            "context_limit",
+            None,
+        ),
+        # b, c: the run's deadline before any model reply, and after one
+        (_report(status="incomplete", stop_reason="wall_time", model_calls=1), "incomplete", "timeout", None),
+        (_report(status="incomplete", stop_reason="wall_time", usages=[USAGE]), "incomplete", "timeout", None),
+        # d: no usable result (an HTTP 500 before the outcome ladder)
+        (_RUNNER_FAILED, "failed", "no_result", {"failure_kind": "agent_run_error"}),
+        # e: 429/5xx after the runner's retries, and a transport failure
+        (_failed(503, replies=1), "failed", "error", {"failure_kind": "model_request_error", "status_code": 503}),
+        (_failed(429), "failed", "error", {"failure_kind": "model_request_error", "status_code": 429}),
+        (_failed(model_transport_error=True), "failed", "error", {"failure_kind": "model_transport_error"}),
+        # f: another 4xx before any reply (a model_request_error before the ladder), and after one
+        (_failed(401), "failed", "error", {"failure_kind": "model_request_rejected"}),
+        (_failed(400, replies=2), "failed", "error", {"failure_kind": "model_request_error", "status_code": 400}),
+        (_report(status="incomplete", stop_reason="max_iterations"), "incomplete", "agent_limit", None),
+        (_report(usages=[USAGE], model_calls=1), "completed", "completed", None),
+    ],
+)
+async def test_each_run_ending_answers_200_with_the_ladders_status(monkeypatch, report, status, stop_reason, outcome):
+    from responses_api_agents.langchain_deepagents_agent.sandbox import DeepAgentsSandboxSession
+
+    monkeypatch.setattr(DeepAgentsAgent, "resolve_model_base_url", lambda *args, **kwargs: "http://model:8000/v1")
+    monkeypatch.setattr(DeepAgentsSandboxSession, "execute", AsyncMock(return_value=report))
+
+    response = await _agent()._run_in_sandbox(
+        NeMoGymResponseCreateParamsNonStreaming(input="task"), _sandbox_state(report)
+    )
+
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == (status, stop_reason)
+    raw = response.metadata.get("ng_agent_outcome")
+    assert (json.loads(raw) if raw is not None else None) == outcome
+    assert (response.error is not None) == (status == "failed")
+
+
+@pytest.mark.parametrize("report", [_report(status="incomplete", stop_reason="wall_time"), _RUNNER_FAILED])
+async def test_a_rollout_stop_is_marked_even_when_the_runner_left_no_report(monkeypatch, report):
+    from responses_api_agents.langchain_deepagents_agent.sandbox import DeepAgentsSandboxSession
+
+    monkeypatch.setattr(DeepAgentsAgent, "resolve_model_base_url", lambda *args, **kwargs: "http://model:8000/v1")
+    monkeypatch.setattr(DeepAgentsSandboxSession, "execute", AsyncMock(return_value=report))
+    state = _sandbox_state(report, expired=True)
+
+    response = await _agent()._run_in_sandbox(NeMoGymResponseCreateParamsNonStreaming(input="task"), state)
+
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == ("incomplete", "stopped")
+    assert json.loads(response.metadata[ROLLOUT_STOP_METADATA_KEY]) == {"reason": "budget"}
+    assert "ng_agent_outcome" not in response.metadata
+
+
+async def test_a_runner_that_left_no_report_reports_its_own_failure(lent_sandbox, runtime):
+    from responses_api_agents.langchain_deepagents_agent.sandbox import DeepAgentsSandboxSession
+
+    owner, access = lent_sandbox
+    session = SimpleNamespace(
+        sandbox=owner, expired_before_launch=False, read_output_log=AsyncMock(return_value="Killed")
+    )
+    state = DeepAgentsSandboxSession(request=_seed(sandbox_access=access), session=session)
+    path = f"{access.workdir}/output.json"
+
+    assert await state.collect_output(path) == _RUNNER_FAILED
+    # A report that is there but cannot be read is a lifecycle failure, not the graph's result.
+    Path(path).write_text("{")
+    with pytest.raises(RuntimeError, match="exited without output"):
+        await state.collect_output(path)
+    Path(path).write_text('{"status": "completed"}')
+    assert await state.collect_output(path) == {"status": "completed"}

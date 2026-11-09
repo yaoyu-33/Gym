@@ -159,19 +159,31 @@ class GymResponsesChatModel(ResponsesChatModel):
         model_reasoning = configurable.get("model_reasoning")
         if model_reasoning is not None:
             request_body["reasoning"] = model_reasoning
-        resp = await self.agent.server_client.post(
-            server_name=self.agent.config.model_server.name,
-            url_path=model_url_path,
-            json=request_body,
-            cookies=model_cookies["cookies"],
-        )
-        await raise_for_status(resp)
+        # Optional too: the agent-session path counts the replies and keeps the failure a run may end on.
+        model_calls = configurable.get("model_calls")
+        try:
+            resp = await self.agent.server_client.post(
+                server_name=self.agent.config.model_server.name,
+                url_path=model_url_path,
+                json=request_body,
+                cookies=model_cookies["cookies"],
+            )
+            await raise_for_status(resp)
+            body = await get_response_json(resp)
+        except Exception as error:
+            if model_calls is not None:
+                model_calls["failure"] = error
+            raise
+        if model_calls is not None:
+            # A later reply means the graph recovered from an earlier failure.
+            model_calls["replies"] += 1
+            model_calls["failure"] = None
         # `model_cookies` is the same holder dict object referenced from `configurable` (not a copy), so
         # this mutation is visible to the next `_agenerate()` call for this rollout — matches
         # `simple_agent`'s pattern of chaining model-server cookies from each response into the next call.
         # It's a deliberate, narrow exception to treating `configurable` as otherwise immutable.
         model_cookies["cookies"] = resp.cookies
-        gym_response = NeMoGymResponse.model_validate(await get_response_json(resp))
+        gym_response = NeMoGymResponse.model_validate(body)
         # Missing usage in any call makes the whole rollout unknown, including later successful calls.
         if gym_response.usage is None:
             model_usage["unknown"] = True

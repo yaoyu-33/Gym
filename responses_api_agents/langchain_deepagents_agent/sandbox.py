@@ -59,7 +59,7 @@ class DeepAgentsSandboxSession(AgentSessionState):
             await upload_text(sandbox, path=f"{package}/__init__.py", text="")
 
     async def execute(self, payload: dict[str, Any], *, timeout: float, close_timeout: float) -> dict[str, Any]:
-        """Run the graph once and return the runner's report, raising the runner's own error."""
+        """Run the graph once and return the runner's report, which may report the runner's own failure."""
         input_path = f"{self.session.session_dir}/input.json"
         output_path = f"{self.session.session_dir}/output.json"
 
@@ -70,28 +70,41 @@ class DeepAgentsSandboxSession(AgentSessionState):
                 argv=[SANDBOX_PYTHON, "-E", "-s", f"{_PACKAGE_DIR}/sandbox_runner.py", input_path, output_path],
             )
 
-        async def collect() -> dict[str, Any]:
-            if self.session.expired_before_launch:
-                return {
-                    "status": "incomplete",
-                    "stop_reason": "wall_time",
-                    "model_error": None,
-                    "messages": [],
-                    "model_calls": 0,
-                    "usages": [],
-                }
-            try:
-                return json.loads(await read_text(self.session.sandbox, path=output_path))
-            except Exception as error:
-                logs = await self.session.read_output_log()
-                raise RuntimeError(f"DeepAgents sandbox runner exited without output: {logs}") from error
-
-        output = await self.session.execute(
-            stage_activation=stage, collect=collect, timeout=timeout, close_timeout=close_timeout
+        return await self.session.execute(
+            stage_activation=stage,
+            collect=lambda: self.collect_output(output_path),
+            timeout=timeout,
+            close_timeout=close_timeout,
         )
-        if output.get("traceback") is not None:
-            raise RuntimeError(f"DeepAgents sandbox runner failed: {output['error']}\n{output['traceback']}")
-        return output
+
+    async def collect_output(self, path: str) -> dict[str, Any]:
+        """The runner's report at ``path``. A runner that left none (killed, or never started; it writes one on every
+        exit it can catch) gets a report of its own failure: the graph left no usable result. A report that is there
+        but cannot be read is a lifecycle failure."""
+        if self.session.expired_before_launch:
+            return {
+                "status": "incomplete",
+                "stop_reason": "wall_time",
+                "model_error": None,
+                "messages": [],
+                "model_calls": 0,
+                "usages": [],
+            }
+        try:
+            return json.loads(await read_text(self.session.sandbox, path=path))
+        except Exception as error:
+            logs = await self.session.read_output_log()
+            if await self._output_absent(path):
+                return {"status": "failed", "error": "exited without output", "traceback": logs[-4000:]}
+            raise RuntimeError(f"DeepAgents sandbox runner exited without output: {logs}") from error
+
+    async def _output_absent(self, path: str) -> bool:
+        """Whether there is no file at ``path``, as opposed to a read that failed."""
+        try:
+            probe = await self.session.sandbox.exec(f"[ -e {quote(path)} ] || echo absent", cwd="/", timeout_s=10)
+        except Exception:
+            return False
+        return probe.return_code == 0 and probe.error_type is None and (probe.stdout or "").strip() == "absent"
 
     async def close(self, timeout: float) -> None:
         """Stop the graph and release the sandbox before cancelling the HTTP activation."""

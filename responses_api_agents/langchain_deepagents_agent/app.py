@@ -20,6 +20,7 @@ Custom in-process graphs may still override build_agent(model).
 """
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import Mapping
@@ -28,6 +29,7 @@ from pathlib import PurePosixPath
 from typing import Any, Literal, Optional
 from uuid import uuid4
 
+from aiohttp import ClientError, ClientResponseError
 from deepagents import create_deep_agent
 from fastapi import Body, HTTPException, Request, Response
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -43,6 +45,7 @@ from nemo_gym.agents import (
     AgentSeedSessionRequest,
     AgentSessionSetupError,
     AgentSessionState,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     assert_model_url_reachable_from_sandbox,
@@ -50,7 +53,6 @@ from nemo_gym.agents import (
 )
 from nemo_gym.config import get_global_config_dict
 from nemo_gym.core import (
-    MODEL_CONTEXT_LIMIT,
     MODEL_REQUEST_ERROR,
     MODEL_TRANSPORT_ERROR,
     NeMoGymEasyInputMessage,
@@ -213,6 +215,32 @@ def _model_error_type(output: Mapping[str, Any]) -> Optional[str]:
     if not output.get("model_error"):
         return None
     return "ModelTransportError" if output.get("model_transport_error") else "ModelRequestError"
+
+
+def _context_limit_reported(body: bytes | str | None) -> bool:
+    """Whether a Model Server error body names a context-limit error; its HTTP status alone cannot prove one."""
+    try:
+        document = json.loads(body) if body else None
+    except (TypeError, ValueError):
+        return False
+    error = document.get("error") if isinstance(document, dict) else None
+    return isinstance(error, dict) and error.get("code") == "context_length_exceeded"
+
+
+def _model_failure(error: Exception) -> dict[str, Any]:
+    """An in-process model call's failure, in the sandbox runner's report fields."""
+    if isinstance(error, ClientResponseError):
+        body = getattr(error, "response_content", None)
+        text = body.decode(errors="replace") if isinstance(body, bytes) else str(body or error.message)
+        return {
+            "model_error": f"Model Server HTTP {error.status}: {text[:2000]}",
+            "model_error_status": error.status,
+            "model_context_limit": _context_limit_reported(body),
+        }
+    return {
+        "model_error": f"{type(error).__name__}: {error}"[:2000],
+        "model_transport_error": isinstance(error, (ClientError, TimeoutError)),
+    }
 
 
 class DeepAgentsAgent(SimpleAgent):
@@ -428,9 +456,10 @@ class DeepAgentsAgent(SimpleAgent):
         )
 
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
-        """The Model Server's HTTP status, or a transport failure, that ended the run, as the runner reported it."""
-        if native_result.get("model_context_limit"):
-            return AgentOutcome(failure_kind=MODEL_CONTEXT_LIMIT)
+        """The Model Server's HTTP status, or a transport failure, that ended the run, as the runner reported it.
+
+        A context-limit rejection is ``RunEvidence.context_limit``, never a classified failure.
+        """
         status = native_result.get("model_error_status")
         if native_result.get("model_error") and type(status) is int and 400 <= status <= 599:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=status)
@@ -493,17 +522,48 @@ class DeepAgentsAgent(SimpleAgent):
             )
             state.provider_wait_failure.__cause__ = failure
             observe_failure(state.provider_wait_failure)
-        response = to_responses(messages_from_dict(output["messages"]), self.config.model_server.name)
+        if output.get("error") is not None:
+            LOG.warning("DeepAgents sandbox runner failed: %s\n%s", output["error"], output.get("traceback", ""))
+            error = f"DeepAgents sandbox runner failed: {output['error']}"[:2000]
+        else:
+            error = output["model_error"]
+        response = to_responses(messages_from_dict(output.get("messages", [])), self.config.model_server.name)
         response.update(
             id=f"deepagents-{capture_key}",
             created_at=int(time.time()),
-            status=output["status"],
+            # Replaced by finish_response.
+            status="completed",
             usage=_usage(output),
-            metadata={"stop_reason": output["stop_reason"]} if output["stop_reason"] else None,
-            error={"code": "server_error", "message": output["model_error"]} if output["model_error"] else None,
+            metadata={"stop_reason": output["stop_reason"]} if output.get("stop_reason") else None,
+            error={"code": "server_error", "message": error} if error else None,
         )
-        response = self.report_rollout_stop(NeMoGymResponse.model_validate(response), state.session)
-        return self.report_outcome(response, output)
+        return self.finish_response(
+            NeMoGymResponse.model_validate(response),
+            self._run_evidence(output, expired=state.session.expired),
+            session=state.session,
+        )
+
+    def _run_evidence(self, output: Mapping[str, Any], *, expired: bool) -> RunEvidence:
+        """How the sandbox runner's graph run ended, from its report.
+
+        ``expired`` is the supervisor's receipt of a rollout stop. It is the only deadline evidence for a runner that
+        left no report of its own (a crash, or a stop while it was still starting).
+        """
+        if output.get("error") is not None:
+            return RunEvidence(has_result=False, timed_out=expired, model_replied=None)
+        stop_reason = output["stop_reason"]
+        return RunEvidence(
+            has_result=output["status"] == "completed",
+            # The runner records a SIGTERM without a stop request as the run's deadline (or a rollout stop).
+            timed_out=stop_reason == "wall_time",
+            # The runner keeps one usage entry, possibly None, for each model call that returned.
+            model_replied=len(output["usages"]) > 0,
+            # Close stopped the graph.
+            stopped=stop_reason == "cancelled",
+            context_limit=stop_reason == "context_limit",
+            model_limit="turns" if stop_reason == "max_iterations" else None,
+            error=self.classify_outcome(output) if output["status"] == "failed" else None,
+        )
 
     async def responses(
         self,
@@ -546,7 +606,7 @@ class DeepAgentsAgent(SimpleAgent):
                 if isinstance(state, DeepAgentsSandboxSession):
                     async with self._sem:
                         return await self._run_in_sandbox(body, state)
-                return await self._run_graph(body, model_url_path=model_url_path, rollout_id=rollout_id)
+                return await self._run_graph_session(body, model_url_path=model_url_path, rollout_id=rollout_id)
 
             state.activation = asyncio.create_task(activate())
         elif body != state.activation_request:
@@ -561,6 +621,74 @@ class DeepAgentsAgent(SimpleAgent):
         model_url_path: str,
         rollout_id: str | None,
     ) -> NeMoGymResponse:
+        """One run of the in-process graph for legacy /run: its response, or the error it ended on."""
+        model_usage = {"usage": None}
+        new_messages = await self._invoke_graph(
+            body,
+            model_url_path=model_url_path,
+            rollout_id=rollout_id,
+            model_usage=model_usage,
+            model_calls={"replies": 0, "failure": None},
+        )
+        response_body = to_responses(new_messages, self.config.model_server.name)
+        response_body["usage"] = model_usage["usage"]
+        return NeMoGymResponse.model_validate(response_body)
+
+    async def _run_graph_session(
+        self,
+        body: NeMoGymResponseCreateParamsNonStreaming,
+        *,
+        model_url_path: str,
+        rollout_id: str | None,
+    ) -> NeMoGymResponse:
+        """An agent-session activation of the in-process graph, answered through the outcome ladder.
+
+        A model call that fails ends the run with a classified outcome: its HTTP status, a transport failure, or an
+        explicit context-limit rejection. The graph keeps no partial messages when it raises, so that response has
+        no output. Any other error is the adapter's and stays an HTTP 500. The graph has no deadline of its own: the
+        Environment Server's episode timeout ends a run that never returns.
+        """
+        model_usage: dict[str, Any] = {"usage": None}
+        model_calls: dict[str, Any] = {"replies": 0, "failure": None}
+        try:
+            new_messages = await self._invoke_graph(
+                body,
+                model_url_path=model_url_path,
+                rollout_id=rollout_id,
+                model_usage=model_usage,
+                model_calls=model_calls,
+            )
+        except Exception as error:
+            if error is not model_calls["failure"]:
+                raise
+            failure = _model_failure(error)
+            context_limit = bool(failure.get("model_context_limit"))
+            response_body = to_responses([], self.config.model_server.name)
+            if not context_limit:
+                response_body["error"] = {"code": "server_error", "message": failure["model_error"]}
+            evidence = RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=model_calls["replies"] > 0,
+                context_limit=context_limit,
+                error=None if context_limit else self.classify_outcome(failure),
+            )
+        else:
+            response_body = to_responses(new_messages, self.config.model_server.name)
+            evidence = RunEvidence(has_result=True, timed_out=False, model_replied=model_calls["replies"] > 0)
+        response_body["usage"] = model_usage["usage"]
+        return self.finish_response(NeMoGymResponse.model_validate(response_body), evidence)
+
+    async def _invoke_graph(
+        self,
+        body: NeMoGymResponseCreateParamsNonStreaming,
+        *,
+        model_url_path: str,
+        rollout_id: str | None,
+        model_usage: dict[str, Any],
+        model_calls: dict[str, Any],
+    ) -> list:
+        """Run the in-process graph on the request's input and return the messages it added."""
         if isinstance(body.input, str):
             input_items = [NeMoGymEasyInputMessage(role="user", content=body.input)]
         else:
@@ -572,13 +700,14 @@ class DeepAgentsAgent(SimpleAgent):
         # to the model server's own session). `GymResponsesChatModel._agenerate()` fills this holder in from
         # each model response and reads it back on the next internal call within this rollout; see
         # responses_langchain_bridge.py. `model_usage` similarly accumulates usage from every internal
-        # model call so the final agent response reports the whole rollout.
-        model_usage = {"usage": None}
+        # model call so the final agent response reports the whole rollout, and `model_calls` counts the model's
+        # replies and keeps the model failure the run may end on.
         run_config: RunnableConfig = {
             "configurable": {
                 "model_url_path": model_url_path,
                 "model_cookies": {"cookies": None},
                 "model_usage": model_usage,
+                "model_calls": model_calls,
                 # deepagents' SummarizationMiddleware offloads evicted history to
                 # `/conversation_history/{thread_id}.md`, appending to that same path on each later
                 # summarization so a rollout accumulates one running log. Without this key it falls back to
@@ -600,11 +729,7 @@ class DeepAgentsAgent(SimpleAgent):
             }
         }
         final_state = await self.agent.ainvoke({"messages": input_messages}, config=run_config)
-
-        new_messages = final_state["messages"][len(input_messages) :]
-        response_body = to_responses(new_messages, self.config.model_server.name)
-        response_body["usage"] = model_usage["usage"]
-        return NeMoGymResponse.model_validate(response_body)
+        return final_state["messages"][len(input_messages) :]
 
     async def run(self, request: Request, body: SimpleAgentRunRequest) -> SimpleAgentVerifyResponse:
         """Keep legacy /run for the search profile; sandbox episodes require an Environment Server."""

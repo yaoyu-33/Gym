@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import orjson
 import pytest
+from aiohttp import ClientConnectionError, ClientResponseError
 from fastapi import HTTPException, Response
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
@@ -891,3 +892,87 @@ async def test_retirement_cancels_a_shielded_in_process_graph():
     with pytest.raises(asyncio.CancelledError):
         await activation
     assert order == ["cancelled"]
+
+
+# --- the outcome ladder on the in-process graph -------------------------------------------------------
+
+
+def _http_error(status: int, body: dict | None = None) -> ClientResponseError:
+    """The error ``raise_for_status`` raises for a Model Server reply with ``status`` and ``body``."""
+    error = ClientResponseError(request_info=MagicMock(), history=(), status=status, message="rejected")
+    error.response_content = orjson.dumps(body or {"error": {"message": "rejected"}})
+    return error
+
+
+def _ls_reply():
+    return _model_response(AIMessage(content="", tool_calls=[{"name": "ls", "args": {"path": "/"}, "id": "ls"}]))
+
+
+@pytest.mark.parametrize(
+    ("replies", "status", "stop_reason", "outcome"),
+    [
+        ([_model_response("done")], "completed", "completed", None),
+        # a: an explicit context-limit rejection (an HTTP 500 before the outcome ladder)
+        (
+            [_http_error(400, {"error": {"code": "context_length_exceeded", "message": "limit"}})],
+            "incomplete",
+            "context_limit",
+            None,
+        ),
+        # e: 429/5xx after the Model Server's retries, and a transport failure (each an HTTP 500 before)
+        (
+            [_ls_reply(), _http_error(503)],
+            "failed",
+            "error",
+            {"failure_kind": "model_request_error", "status_code": 503},
+        ),
+        ([ClientConnectionError("refused")], "failed", "error", {"failure_kind": "model_transport_error"}),
+        # f: another 4xx before any reply, and after one (each an HTTP 500 before)
+        ([_http_error(401)], "failed", "error", {"failure_kind": "model_request_rejected"}),
+        (
+            [_ls_reply(), _http_error(400)],
+            "failed",
+            "error",
+            {"failure_kind": "model_request_error", "status_code": 400},
+        ),
+    ],
+)
+async def test_an_in_process_session_answers_each_model_ending_with_the_ladders_status(
+    replies, status, stop_reason, outcome
+):
+    agent = _make_agent()
+    agent.server_client.post = AsyncMock(side_effect=replies)
+    request = _request()
+    await agent.seed_agent_session(request, _seed_body())
+
+    response = await agent.responses(request, Response(), NeMoGymResponseCreateParamsNonStreaming(input="go"))
+    await agent.close_agent_session(request, _close_body())
+
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == (status, stop_reason)
+    raw = response.metadata.get("ng_agent_outcome")
+    assert (orjson.loads(raw) if raw is not None else None) == outcome
+    assert (response.error is not None) == (status == "failed")
+    if status != "completed":
+        # The graph keeps no partial messages when it raises.
+        assert response.output == []
+    assert agent.server_client.post.await_count == len(replies)
+
+
+async def test_an_in_process_graph_error_that_is_not_a_model_call_stays_the_adapters():
+    agent = _make_agent()
+    agent.agent = MagicMock()
+    agent.agent.ainvoke = AsyncMock(side_effect=RuntimeError("graph bug"))
+    request = _request()
+    await agent.seed_agent_session(request, _seed_body())
+
+    with pytest.raises(RuntimeError, match="graph bug"):
+        await agent.responses(request, Response(), NeMoGymResponseCreateParamsNonStreaming(input="go"))
+    await agent.close_agent_session(request, _close_body())
+
+
+async def test_legacy_run_keeps_raising_a_model_failure():
+    agent = _make_agent()
+    agent.server_client.post = AsyncMock(side_effect=[_http_error(401)])
+
+    with pytest.raises(ClientResponseError):
+        await agent.responses(_request(), Response(), NeMoGymResponseCreateParamsNonStreaming(input="go"))

@@ -113,8 +113,16 @@ session, and then calls `/verify`. The agent's side of that contract:
 - **Close** cancels a graph that is still running. Close returns no resources cookie jar, so `/verify` receives
   the seed's cookies unchanged. It returns an observation bundle with the gaps `agent_transcript_unavailable` and
   `model_call_ownership_unavailable` (see [Open gaps](#open-gapslimitations)).
+- **Outcome.** Gym's shared outcome ladder (`finish_response`) sets the activation's status, `ng_agent_outcome` and
+  `ng_agent_stop_reason`, and the activation answers HTTP 200. A graph that returns is `completed`. A model call
+  that still fails ends the run with an empty output: an explicit context-limit rejection
+  (`error.code: context_length_exceeded`) is `incomplete` and verified; another HTTP error is `failed` with
+  `model_request_error` and its status, or `model_request_rejected` for a 4xx other than 408, 425 and 429 before
+  any model reply; a connection failure or timeout is `failed` with `model_transport_error`. The Environment
+  Server's outcome policy then verifies, retries or fails the episode. Any other error of the graph answers HTTP 500.
 - The agent does not enforce a task's agent timeout (`metadata.agent_timeout_sec`), and it does not support
-  rollout stops (`/rollouts/<id>/stop` answers 501).
+  rollout stops (`/rollouts/<id>/stop` answers 501). Only the Environment Server's episode timeout ends a graph
+  that never returns.
 - **`execute_tools: false`** is rejected when the config loads: the graph always runs its own tools.
 - **Checkpointing** restarts an unfinished rollout from its input. The graph's state lives inside one
   `ainvoke()` call and cannot be exported.
@@ -148,8 +156,14 @@ not list this agent yet, so start its servers with `--allow-unsupported-pairing`
   Server: set `use_absolute_ip: true` for a sandbox outside the host's network. An HTTP 408, 425, 429 or 5xx, or a
   connection failure, is retried twice after the server's `Retry-After` or an exponential backoff, at most 30 s; any
   other 4xx is not retried. A call that still fails ends the run: the response is `failed` and reports the cause in `ng_agent_outcome`
-  (`model_request_error` with the HTTP status, or `model_transport_error`), so the Environment Server's outcome
-  policy decides whether to verify or retry the episode.
+  (`model_request_error` with the HTTP status, `model_request_rejected` for a 4xx other than 408, 425 and 429
+  before any model reply, or `model_transport_error`), so the Environment Server's outcome
+  policy decides whether to verify or retry the episode. An explicit context-limit rejection is `incomplete` with
+  `stop_reason: context_limit`, and it is verified.
+- **Outcome.** The agent reads the runner's report into a `RunEvidence`, and Gym's shared outcome ladder
+  (`finish_response`) sets the status, `ng_agent_outcome` and `ng_agent_stop_reason`; every outcome answers HTTP
+  200. A runner that failed itself, or left no report, is `failed` with `agent_run_error`, which the Environment
+  Server retries. A report that is there but cannot be read answers HTTP 500.
 - **Request fields.** `input`, `instructions` (as a system message), and `temperature`, `top_p` and `reasoning`
   apply to every model call. Request `max_output_tokens` is refused with HTTP 422 because no response-wide
   budget is enforced; configure a per-call limit on the Model Server instead. A request that declares `tools`
@@ -305,7 +319,9 @@ request - it gets the compacted version.
   reported, so that alone accounts for most of the risk. That's considered safe enough to ship as-is; the
   exception-type mismatch itself is still unfixed, so if compaction ever lags (e.g. `max_input_tokens` set
   too high relative to the real limit, compounded by the approximate token counting above), the failure
-  mode is still an opaque `ClientResponseError` rather than a graceful retry. 
+  mode is still an opaque `ClientResponseError` rather than a graceful retry. On the agent-session path that
+  error ends the run as `incomplete` (verified) when its body names `context_length_exceeded`, with no output,
+  because the graph's partial messages are lost when it raises.
 
 - **Known lossy points in the LangChain ↔ Responses translation layer** — see the table and list above:
   unrecognized input item types are dropped silently on one side but raise on the other, `usage_metadata`
