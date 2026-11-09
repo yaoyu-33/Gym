@@ -93,6 +93,10 @@ def test_launch_uses_local_endpoints_and_isolated_workspaces(harness, use_agent_
             assert config["probe_environment"]["environment_servers"][environment_type][
                 "resources_tool_transports"
             ] == ["direct_http"]
+        elif harness == "nooa":
+            assert agent["nooa"]["execution_mode"] == "sandboxed"
+            assert "sandbox_config" not in agent and "sandbox_provider" not in agent
+            assert config["probe_sandbox"] == {"conformance_local": {"concurrency": 1}}
         else:
             assert agent["sandbox_config"]["workdir"] == str(tmp_path / "workspace")
             assert config[agent["sandbox_provider"]] == {"local": {"concurrency": 1}}
@@ -628,8 +632,8 @@ def retained_episode(tmp_path):
         "malformed_outcome",
         "unknown_kind",
         "unregistered_kind",
-        "wrong_status",
-        "invalid_status",
+        "request_error",
+        "rejected_with_status",
     ],
 )
 def test_terminal_model_error_must_be_reported_to_environment(retained_episode, mutation):
@@ -638,9 +642,8 @@ def test_terminal_model_error_must_be_reported_to_environment(retained_episode, 
         {"status_code": 400, "request": {}, "response": {"error": {"message": "controlled model failure"}}}
     ]
     response = {"status": "failed", "error": {"code": "server_error", "message": "HTTP 400: controlled model failure"}}
-    response["metadata"] = {
-        AGENT_OUTCOME_METADATA_KEY: json.dumps({"failure_kind": "model_request_error", "status_code": 400})
-    }
+    # The model never replied, so the ladder reports the 400 as the run's rejected request.
+    response["metadata"] = {AGENT_OUTCOME_METADATA_KEY: json.dumps({"failure_kind": "model_request_rejected"})}
     witness["agent_responses"] = [response]
     if mutation == "missing_response":
         witness["agent_responses"] = []
@@ -659,8 +662,9 @@ def test_terminal_model_error_must_be_reported_to_environment(retained_episode, 
             "malformed_outcome": "{",
             "unknown_kind": json.dumps({"failure_kind": "unknown"}),
             "unregistered_kind": json.dumps({"failure_kind": "invented"}),
-            "wrong_status": json.dumps({"failure_kind": "model_request_error", "status_code": 503}),
-            "invalid_status": json.dumps({"failure_kind": "model_request_error", "status_code": "400"}),
+            # A graded request error is what an adapter reported before the outcome ladder.
+            "request_error": json.dumps({"failure_kind": "model_request_error", "status_code": 400}),
+            "rejected_with_status": json.dumps({"failure_kind": "model_request_rejected", "status_code": 400}),
         }[mutation]
     (directory / "witness.json").write_text(json.dumps(witness))
     result = inspect_episode(SCENARIO["model_error"], directory, {"returncode": 0, "timed_out": False})
