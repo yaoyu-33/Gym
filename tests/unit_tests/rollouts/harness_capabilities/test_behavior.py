@@ -122,6 +122,51 @@ def test_inspect_behavior_takes_the_finish_call_from_the_witness(behavior_episod
     assert checks["tools.witness_ids"]["status"] == status
 
 
+@pytest.mark.parametrize(
+    "mutation,failed",
+    [
+        (None, None),
+        ("missing", "tools.witness_ids"),
+        ("name", "tools.witness_request"),
+        ("arguments", "tools.witness_request"),
+        ("exit_code", "tools.witness_status"),
+        ("outputs", "tools.witness_output"),
+    ],
+)
+def test_additional_native_executions_require_complete_independent_witnesses(behavior_episode, mutation, failed):
+    record, witness = behavior_episode
+    trajectory = record["ng_trajectory"]
+    original = trajectory["tool_calls"][0]
+    trajectory["tool_calls"].append({**original, "tool_call_id": "native-prefill"})
+    conversation = trajectory["invocations"][0]["conversation"]
+    conversation.extend(
+        [
+            {**item, "call_id": "native-prefill"}
+            for item in list(conversation)
+            if item.get("call_id") == original["tool_call_id"]
+        ]
+    )
+    native = {**witness["tool_calls"][0], "id": "native-prefill"}
+    witness["native_tool_calls"] = [native]
+    if mutation == "missing":
+        witness["native_tool_calls"] = []
+    elif mutation == "name":
+        native["name"] = "wrong-tool"
+    elif mutation == "arguments":
+        native["arguments"] = {"code": "not executed"}
+    elif mutation == "exit_code":
+        native["exit_code"] = 7
+    elif mutation == "outputs":
+        native["outputs"] = ["not observed"]
+    options = dict(http_errors=(), terminal_error=False, tool_steps=2, expected_reward=0.0, fingerprint=fingerprint)
+    checks = {check["id"]: check for check in inspect_behavior(witness, record, **options)}
+    assert checks["tools.executed"]["status"] == "pass"
+    if failed:
+        assert checks[failed]["status"] == "fail"
+    else:
+        assert all(check["status"] != "fail" for check in checks.values())
+
+
 def _as_text_parts(outputs: list[str]) -> list[dict]:
     return [{"type": "text", "text": output} for output in outputs]
 
@@ -195,3 +240,37 @@ def test_judge_scenario_requires_witnessed_grade_and_verifier_ownership(missing)
     check = next(c for c in result if c["id"] == "verifier.judge_reference")
     assert check["tier"] == "P1"
     assert check["status"] == ("pass" if missing is None else "fail")
+
+
+@pytest.mark.parametrize(
+    "status, outcome",
+    [
+        # Every request failed, so the model never replied: a non-retryable 4xx is the run's rejected request.
+        *((status, {"failure_kind": "model_request_rejected"}) for status in (400, 401, 403, 404, 413, 422)),
+        *(
+            (status, {"failure_kind": "model_request_error", "status_code": status})
+            for status in (408, 425, 429, 500, 503)
+        ),
+    ],
+)
+def test_terminal_error_expects_the_outcome_ladders_report(status, outcome):
+    from nemo_gym.rollouts.harness_capabilities.behavior import _terminal_error_reported
+
+    attempts = [{"status_code": status, "request": {}, "response": {"error": {"message": "controlled failure"}}}]
+
+    def response(reported: dict) -> list[dict]:
+        return [
+            {
+                "status": "failed",
+                "error": {"message": f"HTTP {status}: controlled failure"},
+                "metadata": {"ng_agent_outcome": json.dumps(reported)},
+            }
+        ]
+
+    assert _terminal_error_reported(attempts, response(outcome), status)
+    other = (
+        {"failure_kind": "model_request_error", "status_code": status}
+        if outcome["failure_kind"] == "model_request_rejected"
+        else {"failure_kind": "model_request_rejected"}
+    )
+    assert not _terminal_error_reported(attempts, response(other), status)
