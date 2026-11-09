@@ -13,6 +13,7 @@ import subprocess
 import tarfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -24,6 +25,7 @@ from yarl import URL
 
 import environment_servers.harbor.overlay as overlay
 import nemo_gym.sandbox.providers.base as sandbox_base
+import nemo_gym.server_runtime.base_environment_server as base_environment_server
 from environment_servers.harbor.app import (
     HarborEnvironmentServer,
     HarborEnvironmentServerConfig,
@@ -1381,6 +1383,73 @@ class TestAgentStage:
         assert response.result.reward == 1.0 and response.result.response.status == "failed"
         assert any("test.sh" in call["command"] for call in sandbox.execs)
 
+    @pytest.mark.parametrize(
+        ("outcome", "scored", "terminal"),
+        [
+            # No usable result is retried, as a bare 5xx was.
+            ('{"failure_kind":"agent_run_error"}', False, False),
+            # A request the model never answered because the run's setup made it invalid: neither graded nor retried.
+            ('{"failure_kind":"model_request_rejected"}', False, True),
+            # A context limit is graded with the partial work.
+            ('{"failure_kind":"model_context_limit"}', True, None),
+        ],
+        ids=["no-result-retried", "rejected-failed", "context-limit-scored"],
+    )
+    async def test_outcome_ladder_defaults(self, tmp_path, monkeypatch, outcome, scored, terminal):
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+        server.server_client.turn_response = self.failed_turn(outcome)
+
+        response = await run_episode(server, task)
+
+        assert any("test.sh" in call["command"] for call in sandbox.execs) is scored
+        if scored:
+            assert response.failure is None, response.failure
+        else:
+            assert response.result is None and response.failure.terminal is terminal
+
+    @staticmethod
+    def reported_turn(outcome: str, selected_kind: str) -> dict:
+        response = TestAgentStage.failed_turn(outcome)
+        response["failure_report"] = {
+            "failure_id": "agent",
+            "events": {
+                "agent": {
+                    "event_id": "agent",
+                    "boundary": "agent",
+                    "failure_kind": selected_kind,
+                    "failure_reason": "stream disconnected before completion",
+                }
+            },
+        }
+        return response
+
+    async def test_failed_turn_keeps_the_kind_its_report_selects(self, tmp_path, monkeypatch):
+        """As on single_agent_turn, the report's selected failure is the episode failure's cause and kind."""
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+        server.server_client.turn_response = self.reported_turn(
+            '{"failure_kind":"model_transport_error"}', "model_transport_error"
+        )
+
+        response = await run_episode(server, task)
+
+        assert response.result is None
+        assert response.failure.terminal is False
+        assert response.failure.failure_kind == "model_transport_error"
+        assert not any("test.sh" in call["command"] for call in sandbox.execs)
+
+    async def test_failed_turn_whose_report_contradicts_its_outcome_fails(self, tmp_path, monkeypatch):
+        """A report selecting another failure than the outcome names is inconsistent evidence: not retried."""
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
+        server.server_client.turn_response = self.reported_turn(
+            '{"failure_kind":"model_transport_error"}', "provider_unavailable"
+        )
+
+        response = await run_episode(server, task)
+
+        assert response.result is None
+        assert response.failure.terminal is True
+        assert not any("test.sh" in call["command"] for call in sandbox.execs)
+
     async def test_agent_outcome_policy_is_configurable(self, tmp_path, monkeypatch):
         server, task, sandbox, _ = make_server(tmp_path, monkeypatch)
         server.config.agent_outcome_policy = AgentOutcomePolicyConfig(
@@ -1457,10 +1526,32 @@ class TestAgentStage:
         assert dumped["ng_agent_observations"]["source"] == "harness"
 
     async def test_episode_deadline_stops_the_sandbox(self, tmp_path, monkeypatch):
-        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, default_episode_timeout_seconds=0.1)
-        server.server_client.slow_path = "/ng-rollout/r1/v1/responses"
+        # The episode's own deadline expires while the harness turn is running. A short deadline also covered the
+        # task snapshot and the seed, and on a slow runner fired before the turn was reached, so the turn expires
+        # the real deadline itself instead.
+        bound = 3600.0
+        server, task, sandbox, _ = make_server(tmp_path, monkeypatch, default_episode_timeout_seconds=bound)
+        deadlines = []
 
-        response = await run_episode(server, task)
+        def recording_timeout(delay):
+            timeout = asyncio.timeout(delay)
+            if delay == bound:
+                deadlines.append(timeout)
+            return timeout
+
+        monkeypatch.setattr(
+            base_environment_server, "asyncio", SimpleNamespace(**{**vars(asyncio), "timeout": recording_timeout})
+        )
+
+        def expire_the_episode_deadline():
+            (deadline,) = deadlines
+            deadline.reschedule(asyncio.get_running_loop().time())
+
+        server.server_client.turn_hooks = [expire_the_episode_deadline]
+        server.server_client.slow_path = "/ng-rollout/r1/v1/responses"
+        server.server_client.slow_seconds = bound
+
+        response = await asyncio.wait_for(run_episode(server, task), 10)
 
         assert response.failure is not None and "timed out" in response.failure.failure_reason
         assert not response.failure.terminal
