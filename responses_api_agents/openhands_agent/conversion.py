@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
 
+from nemo_gym.agents import AgentOutcome, RunEvidence
 from nemo_gym.config import ModelServerRef
 from nemo_gym.core import (
     MODEL_CONTEXT_LIMIT,
@@ -231,54 +232,80 @@ def classify_error(chain: list[dict[str, Any]]) -> tuple[str, Optional[int]]:
 
 @dataclass
 class RunOutcome:
-    """How an activation ended, by OpenHands' own rule at the pinned version."""
+    """How an activation ended, for its observations: the response's status and OpenHands' own stop reason."""
 
     status: Literal["completed", "failed", "incomplete"]
     stop_reason: str
     message: Optional[str] = None
     failure_kind: Optional[str] = None
-    status_code: Optional[int] = None
 
 
-def run_outcome(
-    events: list[tuple[float, dict[str, Any]]],
-    result: Optional[dict[str, Any]],
-    *,
-    timed_out: bool,
-    rollout_stop: bool = False,
-) -> RunOutcome:
-    """Map the runner result to a response status.
+@dataclass(frozen=True)
+class RunEnd:
+    """What the runner's result and events show about how an OpenHands run ended.
+
+    The outcome ladder decides the response from ``evidence``. ``stop_reason`` is OpenHands' own reason, kept in the
+    response metadata and the observations, and ``message`` names what a failed response reports.
+    """
+
+    evidence: RunEvidence
+    stop_reason: str
+    message: Optional[str] = None
+
+
+def run_end(
+    events: list[tuple[float, dict[str, Any]]], result: Optional[dict[str, Any]], *, timed_out: bool
+) -> RunEnd:
+    """Read the runner result and events of an OpenHands 1.59.0 run into the outcome ladder's evidence.
 
     ``conversation.run()`` raises only for errors that end the run, such as a model call that still fails after
-    OpenHands' own retries. Tool errors go back to the model and do not end the run. A run limit (iterations or
-    budget) and stuck detection end the run with partial work, as do a rollout stop and the deadline after a model
-    call returned. A deadline before any model reply leaves nothing to grade, and its cause is unknown: the runner
-    may still have been starting, or the Model Server may not have answered.
+    OpenHands' own retries; the recorded exception chain classifies it (``classify_error``). Tool errors go back to
+    the model and do not end the run. A run limit (iterations or budget) and stuck detection end the run with
+    partial work, a harness limit. A runner that wrote no result, or one that was terminated other than at the
+    deadline, left no usable result. Any model response the events used, or a usage record OpenHands kept, is a
+    model reply.
+
+    A deadline before any model reply stays retried (``retry_deadline_before_reply``): the runner may still have
+    been starting, or the Model Server may not have answered, and nothing yet tells these apart.
     """
+    replied = bool(_response_ids(events) or token_usages(result))
+
+    def end(stop_reason: str, message: Optional[str] = None, **evidence: Any) -> RunEnd:
+        fields = {"has_result": False, "model_replied": replied, **evidence}
+        return RunEnd(
+            RunEvidence(timed_out=timed_out, retry_deadline_before_reply=True, **fields), stop_reason, message
+        )
+
     if timed_out:
-        if rollout_stop or _response_ids(events) or token_usages(result):
-            return RunOutcome("incomplete", "timeout")
-        return RunOutcome("failed", "timeout", "Gym's deadline passed before any model call returned", "unknown")
+        return end("timeout", None if replied else "Gym's deadline passed before any model call returned")
     if result is None:
-        return RunOutcome("failed", "runner_error", "The OpenHands runner wrote no result")
+        return end("runner_error", "The OpenHands runner wrote no result")
     if result.get("status") == "terminated":
-        return RunOutcome("incomplete", "cancelled")
+        # A SIGTERM that was not the deadline's (close cancels the activation before its result is read).
+        return end("cancelled", "The OpenHands runner was terminated before its deadline")
     chain = error_chain(result)
     if result.get("status") == "error" or chain:
         kind, status_code = classify_error(chain)
         message = f"The OpenHands run failed: {describe_chain(chain)}" if chain else "The OpenHands run failed"
-        if kind == MODEL_CONTEXT_LIMIT:
-            return RunOutcome("incomplete", "context_limit", message, kind)
-        return RunOutcome("failed", "error", message, kind, status_code)
+        return end(
+            "context_limit" if kind == MODEL_CONTEXT_LIMIT else "error",
+            message,
+            error=AgentOutcome(failure_kind=kind, status_code=status_code),
+        )
     execution_status = result.get("execution_status")
     if execution_status == "finished":
-        return RunOutcome("completed", "finished")
+        return end("finished", has_result=True)
     if execution_status == "stuck":
-        return RunOutcome("incomplete", "stuck")
+        return end("stuck", model_limit="turns")
     codes = [event.get("code") for _, event in events if event["kind"] == "ConversationErrorEvent"]
     if execution_status == "error" and codes and codes[-1] in RUN_LIMIT_CODES:
-        return RunOutcome("incomplete", RUN_LIMIT_CODES[codes[-1]])
-    return RunOutcome("failed", "error", f"The OpenHands run ended with status {execution_status!r}")
+        return end(RUN_LIMIT_CODES[codes[-1]], model_limit="turns")
+    # OpenHands reported an error state without an error it raised: the cause is unknown.
+    return end(
+        "error",
+        f"The OpenHands run ended with status {execution_status!r}",
+        error=AgentOutcome(failure_kind="unknown"),
+    )
 
 
 @dataclass

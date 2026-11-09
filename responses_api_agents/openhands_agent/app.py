@@ -14,9 +14,11 @@ from typing import Any, ClassVar, Optional
 from uuid import uuid4
 
 from fastapi import HTTPException, Request
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field, field_validator
 
 from nemo_gym.agents import (
+    AGENT_OUTCOME_METADATA_KEY,
     AGENT_TIMEOUT_METADATA_KEY,
     HARNESS_RUNNER_FILE,
     HARNESS_RUNNER_SCRIPT,
@@ -62,7 +64,7 @@ from responses_api_agents.openhands_agent.conversion import (
     output_items,
     parse_events,
     response_usage,
-    run_outcome,
+    run_end,
 )
 from responses_api_agents.openhands_agent.sandbox import (
     OPENHANDS_VERSION,
@@ -421,16 +423,51 @@ class OpenHandsAgent(SimpleResponsesAPIAgent):
                 result = parsed if isinstance(parsed, dict) else None
             except ValueError:
                 result = None
-        outcome = run_outcome(events, result, timed_out=timed_out, rollout_stop=state.session.expired)
+        items = output_items(events)
+        conversation = [NeMoGymEasyInputMessage(role="system", content=system)] if system else []
+        conversation.append(NeMoGymEasyInputMessage(role="user", content=prompt))
+        response: NeMoGymResponse | None = None
         if failure is not None:
             outcome = RunOutcome(
                 "incomplete" if isinstance(failure, asyncio.CancelledError) else "failed",
                 "cancelled" if isinstance(failure, asyncio.CancelledError) else "sandbox_error",
                 f"{type(failure).__name__}: {failure}",
             )
-        items = output_items(events)
-        conversation = [NeMoGymEasyInputMessage(role="system", content=system)] if system else []
-        conversation.append(NeMoGymEasyInputMessage(role="user", content=prompt))
+        else:
+            end = run_end(events, result, timed_out=timed_out)
+            if end.stop_reason in ("error", "runner_error", "cancelled") and artifacts.stderr:
+                # The response names only the error classes; the runner wrote the traceback to its stderr.
+                LOG.warning("%s; the runner's stderr ends with:\n%s", end.message, artifacts.stderr[-4000:])
+            runtime = state.runtime_info
+            response = self.finish_response(
+                NeMoGymResponse(
+                    id=f"resp_{uuid4().hex}",
+                    created_at=int(time()),
+                    model=self.config.model,
+                    object="response",
+                    output=items,
+                    tool_choice=body.tool_choice,
+                    tools=body.tools,
+                    parallel_tool_calls=body.parallel_tool_calls,
+                    usage=response_usage(events, result),
+                    metadata={
+                        "harness_execution": "sandbox",
+                        **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
+                        "openhands_version": OPENHANDS_VERSION,
+                        "stop_reason": end.stop_reason,
+                        AGENT_TIMEOUT_METADATA_KEY: str(timeout),
+                    },
+                ),
+                end.evidence,
+                session=state.session,
+            )
+            if response.status == "failed" and end.message:
+                response = response.model_copy(
+                    update={"error": ResponseError(code="server_error", message=end.message[:4000])}
+                )
+            decided = response.metadata.get(AGENT_OUTCOME_METADATA_KEY)
+            error = AgentOutcome.model_validate_json(decided) if decided else end.evidence.error
+            outcome = RunOutcome(response.status, end.stop_reason, end.message, error.failure_kind if error else None)
         state.observations = self._observations(
             state, events, result, outcome, conversation=[*conversation, *items], malformed=malformed
         )
@@ -439,36 +476,7 @@ class OpenHandsAgent(SimpleResponsesAPIAgent):
         if failure is not None:
             # Termination, transport and capture failures are not results; the episode can be retried.
             raise failure
-        if outcome.stop_reason == "runner_error":
-            raise RuntimeError(f"OpenHands runner failed before writing a result: {artifacts.stderr[-4000:]}")
-        if outcome.stop_reason == "error" and artifacts.stderr:
-            # The response names only the error classes; the runner wrote the traceback to its stderr.
-            LOG.warning("%s; the runner's stderr ends with:\n%s", outcome.message, artifacts.stderr[-4000:])
-        runtime = state.runtime_info
-        response = NeMoGymResponse(
-            id=f"resp_{uuid4().hex}",
-            created_at=int(time()),
-            model=self.config.model,
-            object="response",
-            output=items,
-            status=outcome.status,
-            error={"code": "server_error", "message": outcome.message[:4000]} if outcome.status == "failed" else None,
-            tool_choice=body.tool_choice,
-            tools=body.tools,
-            parallel_tool_calls=body.parallel_tool_calls,
-            usage=response_usage(events, result),
-            metadata={
-                "harness_execution": "sandbox",
-                **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
-                "openhands_version": OPENHANDS_VERSION,
-                "stop_reason": outcome.stop_reason,
-                AGENT_TIMEOUT_METADATA_KEY: str(timeout),
-            },
-        )
-        response = self.report_rollout_stop(response, state.session)
-        # Only a failed response gets an outcome. After the deadline that is one without a model reply, whose
-        # cause is unknown, so no error the runner may have recorded classifies it.
-        return self.report_outcome(response, {} if timed_out else result or {})
+        return response
 
     def _observations(
         self,

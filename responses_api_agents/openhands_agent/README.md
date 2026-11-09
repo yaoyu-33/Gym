@@ -129,6 +129,9 @@ exit code, the working directory, a no-output timeout or truncation, and the run
 OpenHands delivers its final answer through the `finish` tool; that answer is also added as an assistant
 message.
 Status follows OpenHands' own rule at 1.59.0: `conversation.run()` raises only for errors that end the run.
+The adapter reads the runner's result and events into evidence, and the shared outcome ladder decides the
+response (see [Add or update a harness](../../fern/versions/latest/pages/agent-server/add-or-update-a-harness.mdx));
+`ng_agent_stop_reason` names the deciding row and `stop_reason` keeps OpenHands' own reason.
 
 | OpenHands outcome | Response | Verified |
 | --- | --- | --- |
@@ -136,13 +139,15 @@ Status follows OpenHands' own rule at 1.59.0: `conversation.run()` raises only f
 | `MaxIterationsReached`, `MaxBudgetReached`, stuck detection, a rollout stop, or Gym's deadline after a model call returned | `incomplete`; `stop_reason` names it | Yes |
 | Context window exceeded | `incomplete`, `stop_reason` `context_limit` | Yes |
 | Gym's deadline before any model call returned | `failed`, `stop_reason` `timeout`, with `ng_agent_outcome` `unknown` | No: the outcome policy retries it by default |
-| A model error | `failed`, with `ng_agent_outcome` `model_request_error` and the HTTP status the provider's error recorded, or `model_transport_error` | By the outcome policy: by default 400, 413 and 422 are verified, `model_transport_error` and 408, 425, 429 and 5xx are retried, and other statuses fail the episode |
+| A model error | `failed`, with `ng_agent_outcome` `model_request_error` and the HTTP status the provider's error recorded, or `model_transport_error`; a 4xx other than 408, 425 and 429 before any model reply is `model_request_rejected` | By the outcome policy: by default 400, 413 and 422 are verified, `model_transport_error` and 408, 425, 429 and 5xx are retried, and `model_request_rejected` and other statuses fail the episode |
 | Any other error that ends the run, including a model error that recorded no HTTP status | `failed`, with `ng_agent_outcome` `unknown` | No: the outcome policy retries it by default |
-| No result, unconfirmed termination, or a sandbox failure | HTTP error from `/v1/responses` | No |
+| No runner result, or a runner terminated other than at the deadline | `failed`, with `ng_agent_outcome` `agent_run_error` | No: the outcome policy retries it by default |
+| Unconfirmed termination or a sandbox failure | HTTP error from `/v1/responses` | No |
 
 Gym's deadline before any model reply leaves nothing to grade, and the adapter cannot tell its cause: the
 runner may still have been starting, or the Model Server may not have answered. The Environment Server's
-`agent_outcome_policy` retries `unknown` by default; `by_failure_kind` changes that. Once a model call has
+`agent_outcome_policy` retries `unknown` by default; `by_failure_kind` changes that. This case stays retried
+(`retry_deadline_before_reply`) until the Model Server's capture can tell an outage from a slow model. Once a model call has
 returned, the deadline is graded with the work done so far, even if the next call was still waiting on the
 Model Server: the adapter cannot tell a slow reply from a Model Server that stopped answering. A rollout stop
 is graded either way.

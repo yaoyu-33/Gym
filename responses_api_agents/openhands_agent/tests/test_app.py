@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from nemo_gym.agents import (
     AGENT_OUTCOME_METADATA_KEY,
     AGENT_SESSION_COOKIE_KEY,
+    AGENT_STOP_REASON_METADATA_KEY,
     ROLLOUT_STOP_METADATA_KEY,
     AgentSeedRejectedError,
     AgentSeedSessionRequest,
@@ -523,14 +524,49 @@ async def test_unconfirmed_termination_fails_the_activation_with_observations(mo
 
 
 @pytest.mark.asyncio
-async def test_missing_result_is_a_runner_failure(monkeypatch):
+async def test_missing_result_is_no_usable_result(monkeypatch, caplog):
+    # An HTTP 500 before the outcome ladder; the default policy retries agent_run_error the same way.
     instance = agent()
     monkeypatch.setattr(
         adapter.OpenHandsSandboxSession, "execute", AsyncMock(return_value=artifacts(FINISHED_EVENTS[:2], None))
     )
     body = NeMoGymResponseCreateParamsNonStreaming(input="Build it")
-    with pytest.raises(RuntimeError, match="before writing a result: trace"):
-        await instance._activate(session_state(), body, prompt="Build it", system="")
+    state = session_state()
+    response = await instance._activate(state, body, prompt="Build it", system="")
+    assert (response.status, response.metadata["stop_reason"]) == ("failed", "runner_error")
+    assert response.error.message == "The OpenHands runner wrote no result"
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+    assert response.metadata[AGENT_STOP_REASON_METADATA_KEY] == "no_result"
+    assert agent_outcome_policy(response) == OutcomeAction.RETRY
+    # The partial transcript is kept, and the runner's traceback goes to the log, not the response.
+    assert [item.type for item in response.output] == ["function_call", "function_call_output"]
+    assert "the runner's stderr ends with:\ntrace" in caplog.text
+    assert state.observations.records[0].error_type == "agent_run_error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,replied,outcome,action",
+    [
+        # A 4xx before any model reply means the run's setup was refused: neither graded nor retried.
+        (400, False, {"failure_kind": "model_request_rejected"}, OutcomeAction.FAIL),
+        (401, False, {"failure_kind": "model_request_rejected"}, OutcomeAction.FAIL),
+        (429, False, {"failure_kind": "model_request_error", "status_code": 429}, OutcomeAction.RETRY),
+        # After a reply, the request's own status decides as before.
+        (400, True, {"failure_kind": "model_request_error", "status_code": 400}, OutcomeAction.VERIFY),
+    ],
+)
+async def test_a_rejected_first_model_request_is_not_graded(monkeypatch, status_code, replied, outcome, action):
+    instance = agent()
+    error = [{"type": "ConversationRunError"}, {"type": "BadRequestError", "status_code": status_code}]
+    failed = run_result(status="error", execution_status="error", error=error, stats=None)
+    events = FINISHED_EVENTS[:2] if replied else [{"kind": "SystemPromptEvent", "source": "agent"}]
+    monkeypatch.setattr(adapter.OpenHandsSandboxSession, "execute", AsyncMock(return_value=artifacts(events, failed)))
+    body = NeMoGymResponseCreateParamsNonStreaming(input="Build it")
+    response = await instance._activate(session_state(), body, prompt="Build it", system="")
+    assert (response.status, response.metadata["stop_reason"]) == ("failed", "error")
+    assert json.loads(response.metadata[AGENT_OUTCOME_METADATA_KEY]) == outcome
+    assert agent_outcome_policy(response) == action
 
 
 @pytest.mark.parametrize(

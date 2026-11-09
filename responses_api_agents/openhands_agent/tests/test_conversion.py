@@ -5,16 +5,18 @@ import json
 
 import pytest
 
+from nemo_gym.agents import AgentOutcome, RunEvidence, decide_outcome
 from nemo_gym.config import ModelServerRef
 from nemo_gym.core import MODEL_CONTEXT_LIMIT, MODEL_REQUEST_ERROR, MODEL_TRANSPORT_ERROR
 from nemo_gym.trajectory import AgentInvocation, ContextCompactionObservation, ToolCallObservation
 from responses_api_agents.openhands_agent.conversion import (
+    RunOutcome,
     classify_error,
     observation_records,
     output_items,
     parse_events,
     response_usage,
-    run_outcome,
+    run_end,
 )
 
 
@@ -216,7 +218,7 @@ def test_normalized_sdk_details_remain_unknown_and_raw_stats_are_preserved(agent
         invocation_id="rollout",
         model_ref=MODEL,
         conversation=[],
-        outcome=run_outcome(events, run_result, timed_out=False),
+        outcome=RunOutcome("completed", "finished"),
     )
     gaps = {gap.code: gap for gap in evidence.gaps}
     for code in ("cached_token_usage_unavailable", "reasoning_token_usage_unavailable"):
@@ -226,28 +228,53 @@ def test_normalized_sdk_details_remain_unknown_and_raw_stats_are_preserved(agent
 
 
 @pytest.mark.parametrize(
-    "outcome_result,events,expected",
+    "outcome_result,events,stop_reason,evidence,decided",
     [
-        (result(), [], ("completed", "finished")),
-        (result(execution_status="stuck"), [], ("incomplete", "stuck")),
+        (result(), [], "finished", {"has_result": True}, ("completed", None)),
+        # Stuck detection and the run limits are harness limits: the partial work is graded.
+        (result(execution_status="stuck"), [], "stuck", {"model_limit": "turns"}, ("incomplete", None)),
         (
             result(execution_status="error"),
             recorded({"kind": "ConversationErrorEvent", "code": "MaxIterationsReached", "detail": "limit"}),
-            ("incomplete", "max_iterations"),
+            "max_iterations",
+            {"model_limit": "turns"},
+            ("incomplete", None),
         ),
         (
             result(execution_status="error"),
             recorded({"kind": "ConversationErrorEvent", "code": "MaxBudgetReached", "detail": "spent"}),
-            ("incomplete", "max_budget"),
+            "max_budget",
+            {"model_limit": "turns"},
+            ("incomplete", None),
         ),
-        (result(execution_status="error"), [], ("failed", "error")),
-        (result(status="terminated", execution_status="running"), [], ("incomplete", "cancelled")),
-        (None, [], ("failed", "runner_error")),
+        # An error state without a raised error: the cause is unknown.
+        (
+            result(execution_status="error"),
+            [],
+            "error",
+            {"error": AgentOutcome(failure_kind="unknown")},
+            ("failed", "unknown"),
+        ),
+        (
+            result(status="error", error=[{"type": "LLMContextWindowExceedError"}]),
+            [],
+            "context_limit",
+            {"error": AgentOutcome(failure_kind=MODEL_CONTEXT_LIMIT)},
+            ("incomplete", None),
+        ),
+        # A SIGTERM that was not the deadline's leaves no usable result (incomplete before the outcome ladder).
+        (result(status="terminated", execution_status="running"), [], "cancelled", {}, ("failed", "agent_run_error")),
+        # A runner that wrote no result (an HTTP 500 before the outcome ladder).
+        (None, [], "runner_error", {}, ("failed", "agent_run_error")),
     ],
 )
-def test_run_outcome_follows_openhands_terminal_status(outcome_result, events, expected):
-    outcome = run_outcome(events, outcome_result, timed_out=False)
-    assert (outcome.status, outcome.stop_reason) == expected
+def test_run_end_reads_openhands_terminal_status(outcome_result, events, stop_reason, evidence, decided):
+    end = run_end(events, outcome_result, timed_out=False)
+    assert end.stop_reason == stop_reason
+    expected = {"has_result": False, "timed_out": False, "model_replied": False, **evidence}
+    assert end.evidence == RunEvidence(retry_deadline_before_reply=True, **expected)
+    decision = decide_outcome(end.evidence)
+    assert (decision.status, decision.outcome.failure_kind if decision.outcome else None) == decided
 
 
 # What OpenHands records before its first model call returns.
@@ -258,17 +285,25 @@ OPENING = (
 
 
 def test_the_deadline_is_graded_after_a_model_reply_and_a_failure_of_unknown_cause_before_one():
-    replied = run_outcome(recorded(action("c1", "r1")), result("r1", status="terminated"), timed_out=True)
-    assert (replied.status, replied.stop_reason, replied.failure_kind) == ("incomplete", "timeout", None)
+    replied = run_end(recorded(action("c1", "r1")), result("r1", status="terminated"), timed_out=True)
+    assert (replied.stop_reason, replied.evidence.timed_out, replied.evidence.model_replied) == ("timeout", True, True)
+    assert decide_outcome(replied.evidence).status == "incomplete"
     # A usage record also shows a reply, such as one OpenHands answered with an error event.
-    assert run_outcome(recorded(*OPENING), result("r1", status="terminated"), timed_out=True).status == "incomplete"
-    # Without a reply the deadline is all that was observed: no model call needs to have started.
+    usage_only = run_end(recorded(*OPENING), result("r1", status="terminated"), timed_out=True)
+    assert usage_only.evidence.model_replied is True
+    assert decide_outcome(usage_only.evidence).status == "incomplete"
+    # Without a reply the deadline is all that was observed: no model call needs to have started. Until capture can
+    # tell an outage from a slow model, the run stays a retried failure of unknown cause.
     for events, runner_result in ((recorded(*OPENING), result(status="terminated")), ([], None)):
-        silent = run_outcome(events, runner_result, timed_out=True)
-        assert (silent.status, silent.stop_reason, silent.failure_kind) == ("failed", "timeout", "unknown")
+        silent = run_end(events, runner_result, timed_out=True)
+        assert silent.evidence.model_replied is False and silent.evidence.retry_deadline_before_reply
+        decision = decide_outcome(silent.evidence)
+        assert (decision.status, decision.stop_reason, decision.outcome.failure_kind) == (
+            "failed",
+            "timeout",
+            "unknown",
+        )
         assert silent.message == "Gym's deadline passed before any model call returned"
-    # A rollout stop is not a failure, so the stopped run is graded.
-    assert run_outcome([], None, timed_out=True, rollout_stop=True).status == "incomplete"
 
 
 def test_a_model_timeout_openhands_recorded_is_a_transport_failure():
@@ -277,14 +312,10 @@ def test_a_model_timeout_openhands_recorded_is_a_transport_failure():
         {"type": "LLMTimeoutError", "module": "openhands.sdk.llm.exceptions.types", "status_code": None},
         {"type": "Timeout", "module": "litellm.exceptions", "status_code": 408},
     ]
-    outcome = run_outcome(recorded(*OPENING), result(status="error", error=chain), timed_out=False)
-    assert (outcome.status, outcome.stop_reason, outcome.failure_kind, outcome.status_code) == (
-        "failed",
-        "error",
-        MODEL_TRANSPORT_ERROR,
-        None,
-    )
-    assert outcome.message == (
+    end = run_end(recorded(*OPENING), result(status="error", error=chain), timed_out=False)
+    assert (end.stop_reason, end.evidence.error) == ("error", AgentOutcome(failure_kind=MODEL_TRANSPORT_ERROR))
+    assert decide_outcome(end.evidence).status == "failed"
+    assert end.message == (
         "The OpenHands run failed: ConversationRunError caused by LLMTimeoutError caused by Timeout (HTTP 408)"
     )
 
@@ -337,12 +368,16 @@ def test_classify_error_reads_the_whole_exception_chain(chain, expected):
 
 def test_failed_run_and_context_limit_outcomes():
     chain = [{"type": "LLMRateLimitError"}, {"type": "RateLimitError", "status_code": 429}]
-    rate_limited = result(status="error", execution_status="error", error=chain)
-    outcome = run_outcome([], rate_limited, timed_out=False)
-    assert (outcome.status, outcome.failure_kind, outcome.status_code) == ("failed", MODEL_REQUEST_ERROR, 429)
-    overflow = result(status="error", error=[{"type": "LLMContextWindowExceedError"}])
-    outcome = run_outcome([], overflow, timed_out=False)
-    assert (outcome.status, outcome.stop_reason) == ("incomplete", "context_limit")
+    rate_limited = run_end([], result(status="error", execution_status="error", error=chain), timed_out=False)
+    assert rate_limited.evidence.error == AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=429)
+    decision = decide_outcome(rate_limited.evidence)
+    assert (decision.status, decision.outcome) == ("failed", rate_limited.evidence.error)
+    overflow = run_end([], result(status="error", error=[{"type": "LLMContextWindowExceedError"}]), timed_out=False)
+    assert overflow.stop_reason == "context_limit"
+    assert (decide_outcome(overflow.evidence).status, decide_outcome(overflow.evidence).outcome) == (
+        "incomplete",
+        None,
+    )
 
 
 def test_observations_time_each_tool_call_and_fail_nonzero_exits():
@@ -359,7 +394,7 @@ def test_observations_time_each_tool_call_and_fail_nonzero_exits():
         invocation_id="rollout",
         model_ref=MODEL,
         conversation=[],
-        outcome=run_outcome(events, None, timed_out=True),
+        outcome=RunOutcome("incomplete", "timeout"),
     )
     invocation = evidence.records[0]
     assert isinstance(invocation, AgentInvocation)
@@ -389,7 +424,7 @@ def test_condensation_records_its_summary_call_and_neighbors():
         invocation_id="rollout",
         model_ref=MODEL,
         conversation=[],
-        outcome=run_outcome(events, result(), timed_out=False),
+        outcome=RunOutcome("completed", "finished"),
     )
     (compaction,) = [record for record in evidence.records if isinstance(record, ContextCompactionObservation)]
     assert compaction.summary == "earlier work"
