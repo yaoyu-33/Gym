@@ -22,10 +22,13 @@ from omegaconf import OmegaConf
 from nemo_gym.agents import (
     AGENT_OUTCOME_METADATA_KEY,
     AGENT_SESSION_COOKIE_KEY,
+    AGENT_STOP_REASON_METADATA_KEY,
     HARNESS_RUNNER_FILE,
     HARNESS_RUNNER_SCRIPT,
     ROLLOUT_STOP_METADATA_KEY,
+    AgentOutcome,
     AgentSeedSessionRequest,
+    RunEvidence,
     SandboxSession,
     agent_outcome_policy,
     check_agent_seed_rejected,
@@ -115,12 +118,13 @@ def done(reason):
     return {"type": "agent_event", "event": {"type": "done", "reason": reason, "iterations": 1}}
 
 
-COMPLETED = stream(
+COMPLETED_RECORDS = [
     tool("content_start", "call-1", toolName="run_commands", input={"commands": ["ls"]}),
     tool("content_end", "call-1", toolName="run_commands", output=[{"query": "ls", "result": "a", "success": True}]),
     text("Done."),
     run_result("completed", aggregateUsage={"inputTokens": 100, "outputTokens": 7}),
-)
+]
+COMPLETED = stream(*COMPLETED_RECORDS)
 
 
 class FakeSession:
@@ -624,25 +628,38 @@ async def test_staged_runner_isolates_cline_and_captures_its_output(tmp_path, mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("records", "receipt", "status", "failure_kind"),
+    ("records", "receipt", "status", "failure_kind", "stop_reason"),
     [
+        (COMPLETED_RECORDS, cleanup(code=0), "completed", None, "completed"),
         # Cline's own error: a failed response the Environment Server classifies.
         (
             [error_event("Error", "Cannot connect to API: Unable to connect"), run_result("error")],
             cleanup(code=1),
             "failed",
             "model_transport_error",
+            "error",
         ),
-        ([error_event("Error", "stub boom"), run_result("error")], cleanup(code=1), "failed", "unknown"),
-        ([error_event("Error", "400 Invalid request"), run_result("error")], cleanup(code=1), "failed", "unknown"),
-        ([error_event("Error", "429 Rate limited"), run_result("error")], cleanup(code=1), "failed", "unknown"),
-        ([error_event("Error", "503 Unavailable"), run_result("error")], cleanup(code=1), "failed", "unknown"),
-        # A context overflow and an abort leave gradable partial work.
+        (
+            [error_event("Error", "Model returned empty response"), run_result("error")],
+            cleanup(code=1),
+            "failed",
+            "agent_invalid_output",
+            "error",
+        ),
+        ([error_event("Error", "stub boom"), run_result("error")], cleanup(code=1), "failed", "unknown", "error"),
+        # Cline 3.0.55's error events carry no HTTP status, so a 400, 401, 429 or 503 stays unknown (retried) until
+        # the Model Server's capture can supply the failed call's status.
+        *(
+            ([error_event("Error", message), run_result("error")], cleanup(code=1), "failed", "unknown", "error")
+            for message in ("400 Invalid request", "401 Unauthorized", "429 Rate limited", "503 Unavailable")
+        ),
+        # A context overflow, the output-token cap and an abort leave gradable partial work.
         (
             [error_event("ContextWindowOverflowError", "too large", "context_window_exceeded"), run_result("error")],
             cleanup(code=1),
             "incomplete",
             None,
+            "context_limit",
         ),
         (
             [
@@ -652,53 +669,105 @@ async def test_staged_runner_isolates_cline_and_captures_its_output(tmp_path, mo
             cleanup(code=1),
             "incomplete",
             None,
+            "output_limit",
         ),
         # Cline 3.0.55 exits 0 on an abort too.
-        ([text("partial"), run_result("aborted")], cleanup(code=0), "incomplete", None),
-        # The supervisor stopped Cline at its deadline.
-        ([text("partial")], cleanup(code=None, timed_out=True), "incomplete", None),
-        ([], cleanup(code=None, timed_out=True), "failed", "unknown"),
-        ([{"type": "run_start"}], cleanup(code=None, timed_out=True), "failed", "unknown"),
+        ([text("partial"), run_result("aborted")], cleanup(code=0), "incomplete", None, "agent_limit"),
+        # The supervisor stopped Cline at its deadline. Before any recorded model output the run stays retried, as
+        # before the outcome ladder, until capture can tell a slow model from an outage.
+        ([text("partial")], cleanup(code=None, timed_out=True), "incomplete", None, "timeout"),
+        ([], cleanup(code=None, timed_out=True), "failed", "unknown", "timeout"),
+        ([{"type": "run_start"}], cleanup(code=None, timed_out=True), "failed", "unknown", "timeout"),
+        # No run result is no usable result: HTTP 200 failed agent_run_error (retried), no longer an HTTP 500.
+        ([], cleanup(code=0), "failed", "agent_run_error", "no_result"),
+        ([text("partial")], cleanup(code=1), "failed", "agent_run_error", "no_result"),
+        # Only the final run_result is a result; a done event alone is not.
+        ([text("Done."), done("completed")], cleanup(code=0), "failed", "agent_run_error", "no_result"),
     ],
 )
-async def test_activation_status_follows_clines_exit_rule(records, receipt, status, failure_kind):
+async def test_activation_status_follows_the_outcome_ladder(records, receipt, status, failure_kind, stop_reason):
     instance = agent()
     session = FakeSession(artifacts=adapter.ClineArtifacts(stdout=stream(*records), stderr=""), cleanup=receipt)
     state = state_with(session)
     response = await instance._sandbox_response(state, NeMoGymResponseCreateParamsNonStreaming(input="Question"))
     assert response.status == status
-    outcome = (response.metadata or {}).get(AGENT_OUTCOME_METADATA_KEY)
+    assert response.metadata[AGENT_STOP_REASON_METADATA_KEY] == stop_reason
+    outcome = response.metadata.get(AGENT_OUTCOME_METADATA_KEY)
     assert (json.loads(outcome)["failure_kind"] if outcome else None) == failure_kind
-    if failure_kind == "unknown":
+    if failure_kind in ("unknown", "model_transport_error", "agent_run_error"):
         assert json.loads(outcome).get("status_code") is None
         assert agent_outcome_policy(response) == "retry"
+    else:
+        assert agent_outcome_policy(response) == "verify"
+    assert (response.error is not None) == (status == "failed")
+    if stop_reason == "error":
+        # The response names the error Cline ended on.
+        assert response.error.message == records[0]["event"]["error"]["message"]
+    assert (response.incomplete_details.reason if response.incomplete_details else None) == (
+        "max_output_tokens" if stop_reason == "output_limit" else None
+    )
     invocation = next(record for record in state.observations.records if isinstance(record, AgentInvocation))
     assert invocation.status == status
     if receipt["timed_out"]:
         assert invocation.stop_reason == "timeout"
-        if status == "failed":
-            assert response.error.message == "Cline's deadline passed before any model output was recorded"
+
+
+@pytest.mark.parametrize(
+    ("records", "timed_out", "evidence"),
+    [
+        (COMPLETED_RECORDS, False, {"has_result": True, "model_replied": True}),
+        (
+            [error_event("ContextWindowOverflowError", "too large", "context_window_exceeded"), run_result("error")],
+            False,
+            {"error": AgentOutcome(failure_kind="model_context_limit")},
+        ),
+        (
+            [error_event("Error", "Model reached the maximum output token limit"), run_result("error")],
+            False,
+            {"model_limit": "output"},
+        ),
+        (
+            [text("partial"), error_event("Error", "The operation timed out."), run_result("error")],
+            False,
+            {"model_replied": True, "error": AgentOutcome(failure_kind="model_transport_error")},
+        ),
+        (
+            [error_event("Error", "429 Rate limited"), run_result("error")],
+            False,
+            {"error": AgentOutcome(failure_kind="unknown")},
+        ),
+        ([text("partial"), run_result("aborted")], False, {"model_replied": True, "model_limit": "turns"}),
+        # The deadline comes from the supervisor's receipt; a tool call is a model reply.
+        (
+            [tool("content_start", "call-1", toolName="run_commands", input={})],
+            True,
+            {"timed_out": True, "model_replied": True},
+        ),
+        ([], True, {"timed_out": True}),
+        ([text("Done."), done("completed")], False, {"model_replied": True}),
+    ],
+)
+def test_run_evidence_reads_clines_final_run_result(records, timed_out, evidence):
+    stdout = stream(*records)
+    expected = {"has_result": False, "timed_out": False, "model_replied": False, **evidence}
+    assert agent()._run_evidence(stdout, app.parse_cline_events(stdout)[0], timed_out=timed_out) == RunEvidence(
+        retry_deadline_before_reply=True, **expected
+    )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stdout", "code"),
-    [
-        ("", 0),
-        ("", 125),
-        ("", 127),
-        # Only the final run_result is a result; a done event alone is not.
-        (stream(text("Done."), done("completed")), 0),
-    ],
-)
-async def test_run_without_a_result_fails_the_activation(stdout, code):
+@pytest.mark.parametrize("code", [125, 126, 127])
+async def test_runner_that_could_not_start_cline_fails_the_activation(code):
     instance = agent()
     session = FakeSession(
-        artifacts=adapter.ClineArtifacts(stdout=stdout, stderr="cline: crashed"), cleanup=cleanup(code=code)
+        artifacts=adapter.ClineArtifacts(stdout="", stderr="cline: not found"), cleanup=cleanup(code=code)
     )
     state = state_with(session)
-    with pytest.raises(RuntimeError, match="Cline produced no run result .*crashed"):
+    with pytest.raises(
+        NgFailureEvent, match=rf"The runner failed or could not start Cline \(exit {code}\): cline: not found"
+    ) as raised:
         await instance._sandbox_response(state, NeMoGymResponseCreateParamsNonStreaming(input="Question"))
+    assert (raised.value.boundary, raised.value.failure_kind) == ("harness", "agent_route_failed")
     assert state.observations is not None
 
 

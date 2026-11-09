@@ -30,9 +30,11 @@ from typing import Any, ClassVar, Literal, Optional
 from uuid import uuid4
 
 from fastapi import HTTPException, Request
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field, PrivateAttr
 
 from nemo_gym.agents import (
+    AGENT_STOP_REASON_METADATA_KEY,
     AGENT_TIMEOUT_METADATA_KEY,
     HARNESS_COMMAND_NOT_STARTED,
     HARNESS_RUNNER_FAILED,
@@ -44,6 +46,7 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     resolve_agent_timeout,
@@ -53,6 +56,7 @@ from nemo_gym.client import get_response_json, raise_for_status
 from nemo_gym.config import ModelServerRef, ResourcesServerRef
 from nemo_gym.core import (
     AGENT_INVALID_OUTPUT,
+    AGENT_ROUTE_FAILED,
     MODEL_CONTEXT_LIMIT,
     MODEL_TRANSPORT_ERROR,
     NeMoGymEasyInputMessage,
@@ -810,7 +814,8 @@ class ClineAgent(SimpleResponsesAPIAgent):
 
         Cline names a context overflow itself (``ContextWindowOverflowError``, error class
         ``context_window_exceeded``). Its other model errors carry no HTTP status, only the provider's
-        message, so they stay ``unknown`` apart from a request that never got a response.
+        message, so they stay ``unknown`` apart from a request that never got a response, until the Model Server's
+        capture supplies the failed call's status.
         """
         error = native_result.get("error") or {}
         if error.get("name") == "ContextWindowOverflowError" or native_result.get("errorClass") == (
@@ -823,11 +828,35 @@ class ClineAgent(SimpleResponsesAPIAgent):
             return AgentOutcome(failure_kind=AGENT_INVALID_OUTPUT)
         return AgentOutcome(failure_kind="unknown")
 
-    def _reached_model_limit(self, terminal: Mapping[str, Any]) -> bool:
-        """Whether Cline's terminal error is the model's context window or its output-token cap."""
-        message = str((terminal.get("error") or {}).get("message") or "")
-        return self.classify_outcome(terminal).failure_kind == MODEL_CONTEXT_LIMIT or message.startswith(
-            _OUTPUT_LIMIT_ERROR
+    def _run_evidence(self, stdout: str, output_items: list[Any], *, timed_out: bool) -> RunEvidence:
+        """What a Cline 3.0.55 ``--json`` stream shows about how the run ended, for the outcome ladder.
+
+        Cline exits 0 for ``finishReason: completed`` and for an abort alike, so the final ``run_result`` decides:
+        ``completed`` is the result; ``error`` ends the run on the error event Cline names, except that the
+        model's output-token cap is an output limit; an abort or another finish reason is a harness limit, whose
+        partial work is graded. A stream without a ``run_result`` holds no usable result. Any of the stream's output
+        items (``parse_cline_events``), an assistant message or a tool call, counts as a model reply.
+        """
+        finish = _run_result_finish(stdout)
+        error: AgentOutcome | None = None
+        model_limit: Literal["output", "turns"] | None = None
+        if finish == "error":
+            terminal = _terminal_error(stdout)
+            if str((terminal.get("error") or {}).get("message") or "").startswith(_OUTPUT_LIMIT_ERROR):
+                model_limit = "output"
+            else:
+                error = self.classify_outcome(terminal)
+        elif finish is not None and finish != "completed":
+            model_limit = "turns"
+        return RunEvidence(
+            has_result=finish == "completed",
+            timed_out=timed_out,
+            model_replied=bool(output_items),
+            error=error,
+            model_limit=model_limit,
+            # Cline retries failed model calls without reporting their status, so a deadline before any reply
+            # cannot be told from an outage yet: it stays retried until capture supplies the failed calls.
+            retry_deadline_before_reply=True,
         )
 
     async def _seed_agent_session_state(self, body: AgentSeedSessionRequest) -> ClineSandboxSession:
@@ -1134,31 +1163,47 @@ class ClineAgent(SimpleResponsesAPIAgent):
             observe_failure(state.provider_wait_failure)
         stdout = artifacts.stdout if artifacts is not None else ""
         output_items, metadata = parse_cline_events(stdout)
-        terminal = _terminal_error(stdout)
         finish = _run_result_finish(stdout)
         exit_code = cleanup["return_code"] if cleanup is not None and not timed_out else None
-        # Cline 3.0.55 exits 0 for finishReason "completed" and also for an abort, so the final run_result decides
-        # the status; its error event names what ended any other run.
-        crash: str | None = None
-        error_message: str | None = None
+        # The runner failed or could not start Cline: Cline never ran, so this is a launch failure, not a run.
+        not_started = exit_code == HARNESS_RUNNER_FAILED or exit_code in HARNESS_COMMAND_NOT_STARTED
+        response: NeMoGymResponse | None = None
+        usage = _session_usage(stdout)
         if failure is not None:
             status = "incomplete" if isinstance(failure, asyncio.CancelledError) else "failed"
-        elif timed_out:
-            # A supervisor deadline says nothing about whether a model request was ever made.
-            # Without any recorded model output, there is no partial work to grade as a model failure.
-            status = "incomplete" if output_items or state.session.expired else "failed"
-            if status == "failed":
-                error_message = "Cline's deadline passed before any model output was recorded"
-        elif exit_code == HARNESS_RUNNER_FAILED or exit_code in HARNESS_COMMAND_NOT_STARTED or finish is None:
-            status, crash = "failed", f"Cline produced no run result (exit {exit_code})"
-        elif finish == "completed":
-            status = "completed"
-        elif finish == "error" and not self._reached_model_limit(terminal):
+        elif not_started:
             status = "failed"
-            error_message = str((terminal.get("error") or {}).get("message") or metadata.get("error") or "Cline error")
         else:
-            # A context or output-token limit, an abort or another harness limit: the partial work stays gradable.
-            status = "incomplete"
+            runtime = state.runtime_info
+            response = self.finish_response(
+                NeMoGymResponse(
+                    id=f"resp_{uuid4().hex}",
+                    created_at=int(time()),
+                    model=self.config.model,
+                    object="response",
+                    output=output_items,
+                    tool_choice=body.tool_choice,
+                    tools=body.tools,
+                    parallel_tool_calls=body.parallel_tool_calls,
+                    usage=usage,
+                    metadata={
+                        "harness_execution": "sandbox",
+                        "cline_version": self.config.cline_version,
+                        **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
+                        **({"finish_reason": finish} if finish else {}),
+                        AGENT_TIMEOUT_METADATA_KEY: str(timeout),
+                    },
+                ),
+                self._run_evidence(stdout, output_items, timed_out=timed_out),
+                session=state.session,
+            )
+            if response.metadata[AGENT_STOP_REASON_METADATA_KEY] == "error":
+                # Name the error Cline ended on rather than the ladder's generic message.
+                message = (_terminal_error(stdout).get("error") or {}).get("message") or metadata.get("error")
+                response = response.model_copy(
+                    update={"error": ResponseError(code="server_error", message=str(message or "Cline error"))}
+                )
+            status = response.status
         try:
             state.observations = build_cline_observations(
                 stdout,
@@ -1200,38 +1245,21 @@ class ClineAgent(SimpleResponsesAPIAgent):
             )
         if failure is not None:
             raise failure
-        if crash:
+        if response is None:
             stderr = artifacts.stderr if artifacts is not None else ""
-            raise RuntimeError(f"{crash}: {stderr[-4000:]}")
-        usage = _session_usage(stdout)
+            raise NgFailureEvent(
+                boundary="harness",
+                failure_kind=AGENT_ROUTE_FAILED,
+                failure_reason=f"The runner failed or could not start Cline (exit {exit_code}): {stderr[-1500:]}",
+                operation="cline.execute",
+            )
         if usage is None:
             state.observations.gaps.append(
                 ObservationGap(code="model_call_usage_unavailable", detail="Cline reported no final run result")
             )
         elif usage.output_tokens_details.reasoning_tokens is None:
             state.observations.gaps.append(ObservationGap(code="reasoning_token_usage_unavailable"))
-        runtime = state.runtime_info
-        response = NeMoGymResponse(
-            id=f"resp_{uuid4().hex}",
-            created_at=int(time()),
-            model=self.config.model,
-            object="response",
-            output=output_items,
-            status=status,
-            error={"code": "server_error", "message": error_message} if error_message else None,
-            tool_choice=body.tool_choice,
-            tools=body.tools,
-            parallel_tool_calls=body.parallel_tool_calls,
-            usage=usage,
-            metadata={
-                "harness_execution": "sandbox",
-                "cline_version": self.config.cline_version,
-                **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
-                **({"finish_reason": finish} if finish else {}),
-                AGENT_TIMEOUT_METADATA_KEY: str(timeout),
-            },
-        )
-        return self.report_rollout_stop(self.report_outcome(response, terminal), state.session)
+        return response
 
     async def responses(
         self,
