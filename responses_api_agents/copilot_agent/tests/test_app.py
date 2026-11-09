@@ -20,15 +20,21 @@ from pydantic import ValidationError
 
 from nemo_gym.agents import (
     AGENT_OUTCOME_METADATA_KEY,
+    AGENT_STOP_REASON_METADATA_KEY,
     HARNESS_RUNNER_FILE,
     HARNESS_RUNNER_SCRIPT,
+    AgentOutcome,
     AgentSeedSessionRequest,
+    OutcomeAction,
+    RunEvidence,
+    agent_outcome_policy,
     check_agent_seed_rejected,
 )
 from nemo_gym.client import ServerClient
 from nemo_gym.core import (
     EpisodeId,
     FailureHeader,
+    NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NgFailureEvent,
     RequestFailureLog,
@@ -410,6 +416,11 @@ def test_usage_sums_successful_calls_and_keeps_missing_counts_unknown():
         ({"statusCode": 400, "message": "400 bad request"}, ("model_request_error", 400)),
         ({"statusCode": 429}, ("model_request_error", 429)),
         ({"message": "Could not connect to local model provider at http://x/v1."}, ("model_transport_error", None)),
+        # "timed out" is model transport evidence only on a failed model call: Copilot's own session, MCP and tool
+        # waits say it too, and the run's deadline comes only from the supervisor's receipt.
+        ({"errorType": "model_call", "message": "Request timed out."}, ("model_transport_error", None)),
+        ({"errorType": "session", "message": "Turn error: MCP server startup timed out"}, ("unknown", None)),
+        ({"errorType": "execution", "message": "Failed to run /review: timed out"}, ("unknown", None)),
         ({"message": "something else"}, ("unknown", None)),
     ],
 )
@@ -670,11 +681,17 @@ def test_reported_provider_error_is_a_classified_failed_response(setup):
     assert closed.json()["agent_observations"]["records"][0]["status"] == "failed"
 
 
-def test_unexplained_nonzero_exit_is_an_execution_error(setup):
+def test_unexplained_nonzero_exit_is_no_usable_result(setup):
+    # An HTTP 500 before the outcome ladder; the default policy retries agent_run_error the same way.
     agent, sandbox = setup
     sandbox.result["return_code"] = 3
     result, closed = run_session(agent)
-    assert result.status_code == 500
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert (body["status"], body["error"]["message"]) == ("failed", "Copilot exited with code 3")
+    assert json.loads(body["metadata"][AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+    assert body["metadata"][AGENT_STOP_REASON_METADATA_KEY] == "no_result"
+    assert agent_outcome_policy(NeMoGymResponse.model_validate(body)) == OutcomeAction.RETRY
     assert closed.status_code == 200
 
 
@@ -685,33 +702,108 @@ def test_native_startup_error_preserves_bounded_stderr(setup, stderr):
     sandbox.otel = None
     sandbox.stderr = stderr
     sandbox.result["return_code"] = 1
-    with TestClient(agent.setup_webserver()) as client:
-        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
-        assert created.status_code == 200
-        with pytest.raises(NgFailureEvent, match="agent.responses") as error:
-            client.post("/ng-rollout/copilot-smoke-a2/v1/responses", json={"input": "Fix the code"})
-        # The agent route reports the adapter's error as the failure's cause and replies with it.
-        cause = error.value.__cause__
-        assert isinstance(cause, RuntimeError) and "Copilot exited with code 1" in str(cause)
-        assert stderr[-4000:] in str(cause)
-        assert len(str(cause)) < 4100
-        closed = client.post(
-            "/v1/agent_sessions/close",
-            json={
-                "agent_session_id": created.json()["agent_session_id"],
-                "episode_id": seed().episode_id.model_dump(),
-            },
-        )
+    result, closed = run_session(agent)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["status"] == "failed" and body["output"] == []
+    assert json.loads(body["metadata"][AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+    # The failed response keeps the native cause, bounded.
+    message = body["error"]["message"]
+    assert message.startswith("Copilot exited with code 1; stderr: ") and stderr[-4000:] in message
+    assert len(message) < 4100
     assert closed.status_code == 200
     records = closed.json()["agent_observations"]["records"]
     assert records[0]["status"] == "failed" and records[0]["model_calls"] == []
 
 
-def test_missing_result_event_is_an_execution_error(setup):
+def test_missing_result_event_is_no_usable_result(setup):
+    # An HTTP 500 before the outcome ladder; the default policy retries agent_run_error the same way.
     agent, sandbox = setup
     sandbox.events = copilot_events(result=False)
     result, _ = run_session(agent)
-    assert result.status_code == 500
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert (body["status"], body["error"]["message"]) == ("failed", "Copilot ended without a result event")
+    assert json.loads(body["metadata"][AGENT_OUTCOME_METADATA_KEY]) == {"failure_kind": "agent_run_error"}
+
+
+def test_supervisor_error_fails_the_activation(setup):
+    # A supervisor that could not run or stop Copilot is a lifecycle failure, not a run outcome.
+    agent, sandbox = setup
+    sandbox.result["error"] = "supervisor lost the process group"
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
+        assert created.status_code == 200
+        with pytest.raises(NgFailureEvent, match="agent.responses") as error:
+            client.post("/ng-rollout/copilot-smoke-a2/v1/responses", json={"input": "Fix the code"})
+        cause = error.value.__cause__
+        assert isinstance(cause, RuntimeError) and "supervisor lost the process group" in str(cause)
+
+
+@pytest.mark.parametrize(
+    "events,timed_out,return_code,evidence",
+    [
+        (copilot_events(), False, 0, {"has_result": True, "model_replied": True}),
+        # A result with a nonzero exit, or no result, is not a usable result.
+        (copilot_events(), False, 3, {"model_replied": True}),
+        (copilot_events(result=False), False, 0, {"model_replied": True}),
+        # A deadline before any model reply.
+        ([], True, None, {"timed_out": True}),
+        # A provider rejection of the first request: no reply yet.
+        (
+            [{"type": "session.error", "data": {"errorType": "query", "message": "401 denied", "statusCode": 401}}],
+            False,
+            1,
+            {"error": AgentOutcome(failure_kind="model_request_error", status_code=401)},
+        ),
+        # A sub-agent's reply is a model reply too.
+        (
+            [{"type": "assistant.message", "agentId": "sub-1", "data": {"content": "x", "apiCallId": "child-1"}}],
+            True,
+            None,
+            {"timed_out": True, "model_replied": True},
+        ),
+    ],
+)
+def test_run_evidence_reads_copilot_events_and_exit(setup, events, timed_out, return_code, evidence):
+    agent, _ = setup
+    transcript = parse_copilot_events([(0.0, event) for event in events], "inv")
+    expected = {"has_result": False, "timed_out": False, "model_replied": False, **evidence}
+    assert agent._run_evidence(transcript, timed_out=timed_out, return_code=return_code) == RunEvidence(**expected)
+
+
+@pytest.mark.parametrize(
+    "error,status_code,outcome,action",
+    [
+        # Copilot retries 429 and 5xx itself; the one it reports after that is retried by the episode.
+        ({"errorType": "query", "message": "503", "statusCode": 503}, 503, {"status_code": 503}, "retry"),
+        ({"errorType": "query", "message": "429", "statusCode": 429}, 429, {"status_code": 429}, "retry"),
+        # A 4xx before any model reply is the run's setup refused: neither graded nor retried.
+        ({"errorType": "query", "message": "401", "statusCode": 401}, 401, None, "fail"),
+        ({"errorType": "query", "message": "400", "statusCode": 400}, 400, None, "fail"),
+        ({"errorType": "model_call", "message": "fetch failed"}, None, None, "retry"),
+    ],
+)
+def test_terminal_error_before_any_reply_follows_the_outcome_ladder(setup, error, status_code, outcome, action):
+    agent, sandbox = setup
+    sandbox.events = [
+        {"type": "session.error", "data": error},
+        {"type": "result", "sessionId": "copilot-run-1", "exitCode": 1},
+    ]
+    sandbox.otel = otel()
+    sandbox.result["return_code"] = 1
+    result, _ = run_session(agent)
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["status"] == "failed" and body["error"]["message"] == error["message"]
+    reported = json.loads(body["metadata"][AGENT_OUTCOME_METADATA_KEY])
+    if outcome is not None:
+        assert reported == {"failure_kind": "model_request_error", **outcome}
+    elif status_code is not None:
+        assert reported == {"failure_kind": "model_request_rejected"}
+    else:
+        assert reported == {"failure_kind": "model_transport_error"}
+    assert agent_outcome_policy(NeMoGymResponse.model_validate(body)) == action
 
 
 def test_timeout_returns_gradable_partial_work(setup):

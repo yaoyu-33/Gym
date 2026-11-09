@@ -146,8 +146,23 @@ Copilot's session event store cannot be inspected (`compaction_state_unavailable
 Server capture to retain per-call token counts, including compaction. An unreadable telemetry line, such as a
 span cut off mid-write, also makes aggregate usage unknown (`model_usage_telemetry_malformed`).
 
-A provider error that Copilot reports (`session.error`) returns a failed response with a classified cause:
-an HTTP status becomes `model_request_error`, and an unreachable provider becomes `model_transport_error`.
+The adapter reads the run's events and exit into evidence, and the shared outcome ladder decides the
+response (see [Add or update a harness](../../fern/versions/latest/pages/agent-server/add-or-update-a-harness.mdx));
+`ng_agent_stop_reason` names the deciding row. Every finished run answers HTTP 200.
+
+| Copilot run | Response |
+| --- | --- |
+| A `result` event and exit 0 | `completed` |
+| The deadline, before or after a model reply | `incomplete`, with the partial work |
+| A root `session.error` that Copilot did not recover from | `failed`, with the classified cause below |
+| A nonzero exit or no `result` event, without such an error | `failed`, `agent_run_error`: no usable result, retried by default |
+| An error of the process supervisor | The activation fails (HTTP 500) |
+
+A provider error that Copilot reports (`session.error`) is classified: an HTTP status becomes
+`model_request_error`, or `model_request_rejected` for a 4xx other than 408, 425 and 429 before any model
+reply; an unreachable provider becomes `model_transport_error`. A "timed out" message counts as a transport
+error only on a failed model call (`errorType: model_call`): Copilot's own session, MCP and tool waits say it
+too, and the run's deadline comes only from the supervisor.
 As in Copilot's own exit status, errors from sub-agents or hooks, and a model-call error followed by a
 later root assistant message, do not fail the run.
 Root session errors, including recovered model-call errors, remain in the canonical failure report
@@ -155,8 +170,8 @@ forwarded by activation and close. These observations do not select an episode f
 Child conversations and tool observations are not projected into the root invocation; the
 `subagent_hierarchy_unavailable` gap records this limitation. Child model-call references and usage remain retained.
 The Environment Server decides grading and retries. Copilot retries 429 and 5xx responses itself before
-reporting. A timeout returns partial work as incomplete. Other runner or termination failures are execution
-errors. A deadline can interrupt a tool before Copilot reports its result. That tool remains incomplete,
+reporting. A timeout returns partial work as incomplete; a completed or incomplete response without an
+assistant message gains an empty one. A deadline can interrupt a tool before Copilot reports its result. That tool remains incomplete,
 with its observed start and a timing gap; the adapter does not invent a terminal output. Such a partial
 rollout can be graded. The retained-artifact checker accepts the incomplete tool and its absent output;
 other unavailable evidence, such as complete tool timing, remains an explicit gap.

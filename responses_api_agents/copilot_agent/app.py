@@ -34,6 +34,7 @@ from uuid import uuid4
 
 from aiohttp import ClientError, ClientTimeout
 from fastapi import HTTPException, Request
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from nemo_gym.agents import (
@@ -48,6 +49,7 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     resolve_agent_timeout,
@@ -101,7 +103,10 @@ COPILOT_VERSION = "1.0.103"
 SOURCE = "copilot"
 _EXACT_VERSION = re.compile(r"\d+\.\d+\.\d+")
 # Copilot 1.0.103 reports an unreachable BYOK provider with this message and no status code.
-_TRANSPORT_MESSAGES = ("Could not connect to", "fetch failed", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "timed out")
+_TRANSPORT_MESSAGES = ("Could not connect to", "fetch failed", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT")
+# Copilot's own session, MCP and tool waits also say "timed out", so only a failed model call's message that says so
+# is evidence of a model transport timeout. It is never the run's deadline, which only the supervisor reports.
+_MODEL_CALL_TIMEOUT = "timed out"
 _MIN_GLIBC = (2, 28)
 # One exec reports the OS, the CPU and the C library; the Agent Server selects the package from it.
 _PLATFORM_PROBE = (
@@ -508,9 +513,25 @@ class CopilotAgent(SimpleResponsesAPIAgent):
         if type(status) is int and 400 <= status <= 599:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=status)
         message = str(native_result.get("message") or "")
-        if any(marker in message for marker in _TRANSPORT_MESSAGES):
+        if any(marker in message for marker in _TRANSPORT_MESSAGES) or (
+            native_result.get("errorType") == "model_call" and _MODEL_CALL_TIMEOUT in message
+        ):
             return AgentOutcome(failure_kind=MODEL_TRANSPORT_ERROR)
         return AgentOutcome(failure_kind="unknown")
+
+    def _run_evidence(self, transcript: CopilotTranscript, *, timed_out: bool, return_code: int | None) -> RunEvidence:
+        """What a Copilot 1.0.103 run's events and exit show about how it ended, for the outcome ladder.
+
+        The root ``session.error`` that Copilot did not recover from is the error the run ended on. A ``result``
+        event with a clean exit is the result. Any assistant message, reasoning or tool call, a sub-agent's
+        included, counts as a model reply.
+        """
+        return RunEvidence(
+            has_result=transcript.result is not None and return_code in (None, 0),
+            timed_out=timed_out,
+            model_replied=bool(transcript.response_ids or transcript.output),
+            error=self.classify_outcome(transcript.error) if transcript.error is not None else None,
+        )
 
     async def _seed_agent_session_state(self, body: AgentSeedSessionRequest) -> CopilotSandboxSession:
         owns_sandbox = body.sandbox_access is None
@@ -993,29 +1014,19 @@ class CopilotAgent(SimpleResponsesAPIAgent):
         usage = parse_copilot_usage(artifacts.otel, compaction_state=artifacts.compaction_state)
         cleanup = state.session.cleanup
         assert cleanup is not None
-        reported_error = transcript.error is not None and not cleanup["timed_out"] and cleanup["error"] is None
-        execution_error = cleanup["error"]
-        if not reported_error and not cleanup["timed_out"]:
-            if cleanup["return_code"] not in (None, 0):
-                execution_error = execution_error or f"Copilot exited with code {cleanup['return_code']}"
-            elif transcript.result is None:
-                execution_error = execution_error or "Copilot ended without a result event"
-        if execution_error and artifacts.stderr and artifacts.stderr.strip():
-            # Startup failures may emit no JSON events; preserve the native cause before cleanup.
-            execution_error = f"{execution_error}; stderr: {artifacts.stderr.strip()[-4000:]}"
-        status = (
-            "failed" if reported_error or execution_error else "incomplete" if cleanup["timed_out"] else "completed"
+        # The supervisor's own error is a lifecycle failure, not a run outcome: the activation fails.
+        supervisor_error = cleanup["error"]
+        # Why the run left no usable result, for a failed response's error or the supervisor's failure.
+        run_error = supervisor_error or (
+            f"Copilot exited with code {cleanup['return_code']}"
+            if cleanup["return_code"] not in (None, 0)
+            else "Copilot ended without a result event"
+            if transcript.result is None
+            else None
         )
-        if not any(getattr(item, "type", None) == "message" for item in transcript.output) and status != "failed":
-            transcript.output.append(
-                NeMoGymResponseOutputMessage(
-                    id=f"msg-{len(transcript.output)}",
-                    content=[NeMoGymResponseOutputText(text="", annotations=[])],
-                    role="assistant",
-                    status="completed",
-                    type="message",
-                )
-            )
+        if run_error and artifacts.stderr and artifacts.stderr.strip():
+            # Startup failures may emit no JSON events; preserve the native cause before cleanup.
+            run_error = f"{run_error}; stderr: {artifacts.stderr.strip()[-4000:]}"
         # A span lost before the exporter flushed would make the sum a silent subtotal.
         missing_spans = [id_ for id_ in transcript.response_ids if usage is not None and id_ not in usage.response_ids]
         known = (
@@ -1030,12 +1041,6 @@ class CopilotAgent(SimpleResponsesAPIAgent):
             model=self.config.model,
             object="response",
             output=transcript.output,
-            status=status,
-            error=(
-                {"code": "server_error", "message": str((transcript.error or {}).get("message") or execution_error)}
-                if status == "failed"
-                else None
-            ),
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -1061,6 +1066,32 @@ class CopilotAgent(SimpleResponsesAPIAgent):
                 AGENT_TIMEOUT_METADATA_KEY: str(timeout),
             },
         )
+        if supervisor_error:
+            status = "failed"
+        else:
+            evidence = self._run_evidence(
+                transcript, timed_out=cleanup["timed_out"], return_code=cleanup["return_code"]
+            )
+            response = self.finish_response(response, evidence, session=state.session)
+            status = response.status
+            if status == "failed":
+                # Copilot's own error message, or why the run left no result.
+                message = (transcript.error or {}).get("message") or run_error or "Copilot reported a session error"
+                response = response.model_copy(
+                    update={"error": ResponseError(code="server_error", message=str(message))}
+                )
+            elif not any(getattr(item, "type", None) == "message" for item in transcript.output):
+                # A graded response carries an assistant message, an empty one when Copilot wrote none.
+                transcript.output.append(
+                    NeMoGymResponseOutputMessage(
+                        id=f"msg-{len(transcript.output)}",
+                        content=[NeMoGymResponseOutputText(text="", annotations=[])],
+                        role="assistant",
+                        status="completed",
+                        type="message",
+                    )
+                )
+                response = response.model_copy(update={"output": list(transcript.output)})
         try:
             state.observations = self._observations(
                 state, transcript, usage, [*conversation, *transcript.output], status, artifacts=artifacts
@@ -1071,10 +1102,8 @@ class CopilotAgent(SimpleResponsesAPIAgent):
             state.observations = AgentObservationBundle(
                 source=SOURCE, gaps=[ObservationGap(code="observation_parse_failed")]
             )
-        if execution_error:
-            raise RuntimeError(f"Copilot agent failed: {execution_error}")
-        if reported_error:
-            return self.report_outcome(response, transcript.error)
+        if supervisor_error:
+            raise RuntimeError(f"Copilot agent failed: {run_error}")
         return response
 
     async def responses(
