@@ -217,10 +217,18 @@ async def test_infrastructure_faults_keep_typed_origin_and_cause_through_the_rou
         response, replay, close = await asyncio.to_thread(exercise_routes)
     finally:
         model.close()
-    assert response.status_code == replay.status_code == 503
+    # A typed lifecycle failure (a bare 503 before the outcome ladder): still retried, never graded.
+    assert response.status_code == replay.status_code == 500
     failure = FailureHeader.decode(response.headers)
     assert failure is not None and failure.failure_id is not None
-    root = failure.events[failure.failure_id]
+    route = failure.events[failure.failure_id]
+    assert (route.boundary, route.failure_kind, route.stage, route.operation) == (
+        "agent",
+        "agent_route_failed",
+        "agent",
+        "crewai.activate",
+    )
+    root = failure.events[route.cause_id]
     assert (root.boundary, root.failure_kind, root.stage) == ("harness", "agent_run_error", "agent")
     assert root.operation == ("shell_start" if failure_source == "shell_start" else "mcp_list_tools")
     assert root.cause_id is not None
@@ -323,7 +331,7 @@ async def test_a_call_the_server_answers_with_a_json_rpc_error_reaches_the_model
     finally:
         model.close()
 
-    # Not an infrastructure failure (503): the model sees the error and carries on.
+    # Not an infrastructure failure (a typed 500): the model sees the error and carries on.
     assert response.status == "completed"
     assert "city must not be empty" in model.requests[1]["json"]["messages"][-1]["content"]
     [tool] = _records(close, "tool_call")

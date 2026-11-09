@@ -32,10 +32,12 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxNetworkAccess,
     SandboxSession,
     SimpleResponsesAPIAgent,
     assert_model_url_reachable_from_sandbox,
+    decide_outcome,
     resolve_agent_timeout,
     restrict_sandbox_network,
 )
@@ -43,10 +45,8 @@ from nemo_gym.config import ModelServerRef, ResourcesServerRef, get_global_confi
 from nemo_gym.core import (
     AGENT_INVALID_OUTPUT,
     AGENT_RUN_ERROR,
-    MODEL_CONTEXT_LIMIT,
     MODEL_REQUEST_ERROR,
     MODEL_TRANSPORT_ERROR,
-    FailureHeader,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseInputTokensDetails,
@@ -54,7 +54,7 @@ from nemo_gym.core import (
     NeMoGymResponseUsage,
     NgFailureEvent,
     SdkErrorDetails,
-    failure_report_for,
+    agent_route_failure,
     observe_failure,
     sdk_error_details,
 )
@@ -203,13 +203,6 @@ def _usage(usage: Mapping[str, int | None] | None) -> NeMoGymResponseUsage | Non
         input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=usage["cached"]),
         output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=usage["reasoning"]),
     )
-
-
-def _response_status(report: Mapping[str, Any]) -> tuple[str, dict[str, str] | None]:
-    """The activation's status and incomplete details: a final answer cut off at the output cap is incomplete."""
-    if report["status"] == "completed" and report["finish_reason"] == "length":
-        return "incomplete", {"reason": "max_output_tokens"}
-    return report["status"], None
 
 
 def _run_end(report: Mapping[str, Any] | None) -> tuple[str, str | None]:
@@ -546,51 +539,82 @@ class CrewAIAgent(SimpleResponsesAPIAgent):
                 )
                 state.provider_wait_failure.__cause__ = failure
                 observe_failure(state.provider_wait_failure)
-            if report.get("error") is not None:
-                raise RuntimeError(f"CrewAI sandbox runner failed: {report['error']}\n{report.get('traceback', '')}")
             if report.get("configuration_error") is not None:
                 raise HTTPException(422, report["configuration_error"])
-            if report["infrastructure_error"] is not None:
-                state.infrastructure_failure = _infrastructure_failure(report["infrastructure_error"])
+            if report.get("infrastructure_error") is not None:
+                # A grant or the sandbox's bash failed underneath the crew: a lifecycle failure, not the model's
+                # result. The route failure only routes the runner's typed failure and its causes, which the failure
+                # header carries and close replays.
+                cause = _infrastructure_failure(report["infrastructure_error"])
+                state.infrastructure_failure = agent_route_failure(cause, operation="crewai.activate", stage="agent")
+                state.infrastructure_failure.__cause__ = cause
                 observe_failure(state.infrastructure_failure)
-                raise HTTPException(
-                    503,
-                    f"CrewAI episode infrastructure failed: {state.infrastructure_failure.failure_reason}",
-                    headers=FailureHeader.encode(failure_report_for(state.infrastructure_failure)),
-                ) from state.infrastructure_failure
-            return self.report_rollout_stop(self._response(state, instruction, report), state.session)
+                raise state.infrastructure_failure from cause
+            if report.get("error") is not None:
+                LOG.warning("CrewAI sandbox runner failed: %s\n%s", report["error"], report.get("traceback", ""))
+            return self.finish_response(
+                self._response(state, instruction, report),
+                self._run_evidence(report, expired=state.session.expired),
+                session=state.session,
+            )
 
     def _response(
         self, state: CrewAISessionState, instruction: _Instruction, report: Mapping[str, Any]
     ) -> NeMoGymResponse:
-        status, incomplete_details = _response_status(report)
-        metadata = {"crewai_model_calls": str(report["model_calls"]), "crewai_tool_calls": str(report["tool_runs"])}
-        if status == "incomplete" and incomplete_details is None:
-            metadata["crewai_stop_reason"] = "context_limit" if report["stop_reason"] == "context_limit" else "timeout"
-        response = NeMoGymResponse(
+        """The crew's transcript and usage; ``finish_response`` sets the status from the run's evidence."""
+        if report.get("error") is not None:
+            message = f"CrewAI sandbox runner failed: {report['error']}"[:2000]
+        else:
+            message = report.get("error_message")
+        metadata = {}
+        if "model_calls" in report:
+            metadata = {
+                "crewai_model_calls": str(report["model_calls"]),
+                "crewai_tool_calls": str(report["tool_runs"]),
+            }
+        return NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
             model=instruction.model or self.config.model_server.name,
             object="response",
-            output=report["output"],
-            status=status,
-            incomplete_details=incomplete_details,
-            error=ResponseError(code="server_error", message=report["error_message"]) if status == "failed" else None,
+            output=report.get("output", []),
+            # Replaced by finish_response.
+            status="completed",
+            error=ResponseError(code="server_error", message=message) if message else None,
             metadata=metadata,
             tool_choice=state.activation_request.tool_choice,
             tools=state.activation_request.tools,
             parallel_tool_calls=state.activation_request.parallel_tool_calls,
-            usage=_usage(report["usage"]),
+            usage=_usage(report.get("usage")),
         )
-        return self.report_outcome(response, report)
+
+    def _run_evidence(self, report: Mapping[str, Any], *, expired: bool) -> RunEvidence:
+        """How the crew's run ended, from the runner's report.
+
+        ``expired`` is the supervisor's receipt of a rollout stop. It is the only deadline evidence for a runner that
+        left no report of its own (a crash, or a stop while it was still starting).
+        """
+        if report.get("error") is not None:
+            return RunEvidence(has_result=False, timed_out=expired, model_replied=None)
+        completed = report["status"] == "completed"
+        return RunEvidence(
+            has_result=completed,
+            # The runner records a SIGTERM without a stop request as the run's deadline (or a rollout stop).
+            timed_out=report["stop_reason"] == "wall_time",
+            model_replied=report["model_calls"] > 0,
+            # Close stopped the crew.
+            stopped=report["stop_reason"] == "cancelled",
+            context_limit=report["stop_reason"] == "context_limit",
+            model_limit="output" if completed and report["finish_reason"] == "length" else None,
+            error=self.classify_outcome(report) if report["status"] == "failed" else None,
+        )
 
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
         """A crew run that raised: the model request that failed, if one did; an empty answer is the model's invalid
-        output; CrewAI's other errors are unknown."""
+        output; CrewAI's other errors are unknown. The runner reports a context-limit rejection as its own stop
+        reason, never as a failure."""
         failure = native_result.get("model_failure") or {}
         status = failure.get("status")
-        if failure.get("context_limit"):
-            return AgentOutcome(failure_kind=MODEL_CONTEXT_LIMIT)
         if type(status) is int and 400 <= status <= 599:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=status)
         if failure.get("transport"):
@@ -628,8 +652,8 @@ class CrewAIAgent(SimpleResponsesAPIAgent):
         invocation_id = report["invocation_id"]
         invocation = AgentInvocation(
             invocation_id=invocation_id,
-            # The response's status: a final answer cut off at the output cap makes it incomplete.
-            status=_response_status(report)[0],
+            # The response's status, from the same evidence.
+            status=decide_outcome(self._run_evidence(report, expired=state.session.expired)).status,
             stop_reason="timeout"
             if report["stop_reason"] == "wall_time"
             else "context_limit"

@@ -73,16 +73,32 @@ class CrewAISessionState(AgentSessionState):
                 argv=[SANDBOX_PYTHON, "-E", "-s", f"{_PACKAGE_DIR}/sandbox_runner.py", input_path, output_path]
             )
 
-        async def collect() -> dict[str, Any]:
-            try:
-                return json.loads(await read_text(self.session.sandbox, path=output_path))
-            except Exception as error:
-                logs = await self.session.read_output_log()
-                raise RuntimeError(f"CrewAI sandbox runner exited without a report: {logs}") from error
-
         return await self.session.execute(
-            stage_activation=stage, collect=collect, timeout=timeout, close_timeout=close_timeout
+            stage_activation=stage,
+            collect=lambda: self.collect_report(output_path),
+            timeout=timeout,
+            close_timeout=close_timeout,
         )
+
+    async def collect_report(self, path: str) -> dict[str, Any]:
+        """The runner's report at ``path``. A runner that left none (killed, or never started; it writes one on every
+        exit it can catch) gets a report of its own failure: the crew left no usable result. A report that is there
+        but cannot be read is a lifecycle failure."""
+        try:
+            return json.loads(await read_text(self.session.sandbox, path=path))
+        except Exception as error:
+            logs = await self.session.read_output_log()
+            if await self._report_absent(path):
+                return {"status": "failed", "error": "exited without a report", "traceback": logs[-4000:]}
+            raise RuntimeError(f"CrewAI sandbox runner exited without a report: {logs}") from error
+
+    async def _report_absent(self, path: str) -> bool:
+        """Whether there is no file at ``path``, as opposed to a read that failed."""
+        try:
+            probe = await self.session.sandbox.exec(f"[ -e {quote(path)} ] || echo absent", cwd="/", timeout_s=10)
+        except Exception:
+            return False
+        return probe.return_code == 0 and probe.error_type is None and (probe.stdout or "").strip() == "absent"
 
     async def close(self, timeout: float) -> None:
         """Stop the crew and release the sandbox before cancelling the HTTP activation."""

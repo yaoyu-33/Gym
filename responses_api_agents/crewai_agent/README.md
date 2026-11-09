@@ -185,13 +185,14 @@ Seeds the adapter cannot serve answer 422: a required grant other than `mcp`, no
 `SandboxAccess.user` override, and a loopback model URL for a remote sandbox provider.
 Activations that ask for tools the grants cannot provide answer 422: tool names that collide (with `shell` or with each
 other) after CrewAI sanitizes them, and request tools that no grant serves. A required MCP grant that does not list its
-tools fails the activation with 503 before the first model call, which the Environment Server retries; an optional one
-is skipped with an `mcp_server_skipped` gap.
+tools fails the activation with a typed HTTP 500 before the first model call, which the Environment Server retries; an
+optional one is skipped with an `mcp_server_skipped` gap.
 
 An MCP grant or the sandbox's `bash` that fails underneath the crew stops it at its next call, and the activation
-answers 503, so the episode is retried instead of graded. Its failure header records a stable
-`harness/agent_run_error` event with the operation (`shell_start`, `mcp_list_tools` or `mcp_call_tool`), grant name when
-applicable, and bounded exception cause facts. An observed MCP connection failure or timeout retains its transport
+fails with a typed HTTP 500 (a lifecycle failure), so the episode is retried instead of graded. Its failure header
+selects an `agent/agent_route_failed` event for `crewai.activate`, whose cause is a stable `harness/agent_run_error`
+event with the operation (`shell_start`, `mcp_list_tools` or `mcp_call_tool`), grant name when applicable, and bounded
+exception cause facts. An observed MCP connection failure or timeout retains its transport
 kind; an HTTP rejection retains its actual status. These are runner failures, not invented sandbox-provider errors;
 actual provider failures retain their shared-layer classifications. Close replays the same event identities.
 Diagnostics select exception type, OS error text or HTTP status without serializing request URLs, headers or bodies.
@@ -213,13 +214,18 @@ Diagnostics select exception type, OS error text or HTTP status without serializ
 
 The response holds the crew's transcript: reasoning items, assistant messages, function calls and the tool results
 CrewAI sent to the model. Usage is the sum over every model call, or unknown with a `model_call_usage_unavailable`
-gap when one call reported none. A run that hits `timeout` answers `incomplete` with its partial work, which is graded;
+gap when one call reported none. The adapter reads the runner's report into a `RunEvidence`, and Gym's shared outcome
+ladder (`finish_response`) sets the status, `ng_agent_outcome` and `ng_agent_stop_reason`; every outcome answers HTTP
+200. A run that hits `timeout` answers `incomplete` with its partial work, which is graded;
 a rollout stop does the same and adds its `ng_rollout_stop` marker. A final answer cut off at the output cap answers
 `incomplete` with `max_output_tokens`. A failed model request answers `failed` with `ng_agent_outcome` naming
-`model_request_error` and its status; a transport failure names `model_transport_error`; an answer with neither text
+`model_request_error` and its status; a 4xx other than 408, 425 and 429 before any model reply names
+`model_request_rejected` instead, which is neither graded nor retried; a transport failure names
+`model_transport_error`; an answer with neither text
 nor a tool call, which CrewAI asks for once more before it raises `EmptyLLMResponseError`, names
 `agent_invalid_output`. An unclassified CrewAI exception returns `failed` with
-`ng_agent_outcome.failure_kind="unknown"`; the default Environment Server outcome policy retries that episode.
+`ng_agent_outcome.failure_kind="unknown"`; the default Environment Server outcome policy retries that episode. A runner
+that failed itself or left no report returns `failed` with `agent_run_error`, which is retried too.
 CrewAI does not run a failed task again
 (`max_retry_limit=0`): the Environment Server's outcome policy decides whether the episode is verified or retried.
 When CrewAI reaches `max_iter` it asks the model for a final answer, and the run counts as completed, as CrewAI counts

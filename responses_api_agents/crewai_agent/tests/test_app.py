@@ -387,7 +387,7 @@ async def test_a_crew_that_runs_out_of_time_answers_incomplete(lent_sandbox, run
         model.close()
 
     assert time.monotonic() - started < 60
-    assert (response.status, response.metadata["crewai_stop_reason"]) == ("incomplete", "timeout")
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == ("incomplete", "timeout")
     assert (workdir / "partial.txt").read_text() == "partial\n"
     # The second model call never returned, so the run's usage is unknown.
     assert response.usage is None
@@ -451,7 +451,9 @@ async def test_a_rollout_stop_ends_the_run_as_a_marked_timeout(lent_sandbox, run
 
 
 @linux_only
-async def test_a_rejected_model_request_fails_the_activation_with_its_status(lent_sandbox, runtime, monkeypatch):
+async def test_a_model_request_rejected_before_any_reply_fails_the_activation_ungraded(
+    lent_sandbox, runtime, monkeypatch
+):
     _, access = lent_sandbox
     model = _model(monkeypatch, 400)
     try:
@@ -459,11 +461,10 @@ async def test_a_rejected_model_request_fails_the_activation_with_its_status(len
     finally:
         model.close()
 
+    # The outcome ladder: a 4xx other than 408/425/429 before any model reply is the run's setup, not the model's
+    # answer (it was a graded model_request_error 400 before the ladder).
     assert response.status == "failed"
-    assert json.loads(response.metadata["ng_agent_outcome"]) == {
-        "failure_kind": "model_request_error",
-        "status_code": 400,
-    }
+    assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "model_request_rejected"}
     [invocation] = _records(close, "agent_invocation")
     [record] = _records(close, "sandbox")
     assert invocation.status == "failed"
@@ -490,9 +491,16 @@ async def test_a_short_rate_limit_burst_recovers_with_server_retry_after(lent_sa
 
 
 @linux_only
-@pytest.mark.parametrize("status, attempts", [(400, 1), (429, 2)])
+@pytest.mark.parametrize(
+    "status, attempts, outcome",
+    [
+        # A deterministic rejection before any reply is model_request_rejected under the outcome ladder.
+        (400, 1, {"failure_kind": "model_request_rejected"}),
+        (429, 2, {"failure_kind": "model_request_error", "status_code": 429}),
+    ],
+)
 async def test_retry_exhaustion_keeps_actual_status_and_deterministic_rejections_do_not_retry(
-    lent_sandbox, runtime, monkeypatch, status, attempts
+    lent_sandbox, runtime, monkeypatch, status, attempts, outcome
 ):
     _, access = lent_sandbox
     model = _model(monkeypatch, (status, {"error": {"message": "rejected"}}, {"Retry-After": "0.01"}))
@@ -501,10 +509,7 @@ async def test_retry_exhaustion_keeps_actual_status_and_deterministic_rejections
     finally:
         model.close()
     assert response.status == "failed" and len(model.requests) == attempts
-    assert json.loads(response.metadata["ng_agent_outcome"]) == {
-        "failure_kind": "model_request_error",
-        "status_code": status,
-    }
+    assert json.loads(response.metadata["ng_agent_outcome"]) == outcome
 
 
 @linux_only
@@ -859,7 +864,8 @@ async def test_explicit_context_rejection_keeps_partial_work_gradable(lent_sandb
         model.close()
     assert response.status == "incomplete"
     assert response.error is None
-    assert response.metadata["crewai_stop_reason"] == "context_limit"
+    assert response.metadata["ng_agent_stop_reason"] == "context_limit"
+    assert "ng_agent_outcome" not in response.metadata
     [invocation] = _records(close, "agent_invocation")
     assert invocation.stop_reason == "context_limit"
 
@@ -960,3 +966,242 @@ async def test_unclassified_crew_exception_returns_failed_unknown_and_survives_c
     assert (sandbox.outcome, sandbox.error_type) == ("failed", "RuntimeError")
     assert close.cleanup_confirmed is True
     close_state.assert_awaited_once_with(agent.config.session_close_timeout_seconds)
+
+
+# --- the outcome ladder: the runner's report -> RunEvidence -> the response --------------------------------
+
+
+def _report(**fields: Any) -> dict[str, Any]:
+    """A runner report as ``sandbox_runner.run`` writes it, with ``fields`` setting how the run ended."""
+    from responses_api_agents.crewai_agent.sandbox_runner import Transcript
+
+    return {
+        **Transcript(_EPISODE.capture_key).report(),
+        "status": "completed",
+        "stop_reason": None,
+        "error_type": None,
+        "error_message": None,
+        **fields,
+    }
+
+
+def _failed(status: int | None = None, *, model_calls: int = 0, **failure: Any) -> dict[str, Any]:
+    """A crew run that raised on a model request that failed with ``status``, or on another model failure."""
+    return _report(
+        status="failed",
+        error_type="ModelRequestError",
+        error_message=f"ModelRequestError: Model HTTP {status}",
+        model_failure={"status": status, "context_limit": False} if status is not None else failure,
+        model_calls=model_calls,
+    )
+
+
+_CONTEXT_LIMIT = _report(
+    status="incomplete", stop_reason="context_limit", model_failure={"status": 400, "context_limit": True}
+)
+_RUNNER_FAILED = {"status": "failed", "error": "exited without a report", "traceback": ""}
+
+
+@pytest.mark.parametrize(
+    ("report", "evidence"),
+    [
+        (_report(model_calls=1), app.RunEvidence(has_result=True, timed_out=False, model_replied=True)),
+        (
+            _report(model_calls=1, finish_reason="length"),
+            app.RunEvidence(has_result=True, timed_out=False, model_replied=True, model_limit="output"),
+        ),
+        (
+            _report(status="incomplete", stop_reason="wall_time"),
+            app.RunEvidence(has_result=False, timed_out=True, model_replied=False),
+        ),
+        (
+            _report(status="incomplete", stop_reason="cancelled", model_calls=2),
+            app.RunEvidence(has_result=False, timed_out=False, model_replied=True, stopped=True),
+        ),
+        (_CONTEXT_LIMIT, app.RunEvidence(has_result=False, timed_out=False, model_replied=False, context_limit=True)),
+        (
+            _failed(401),
+            app.RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=False,
+                error=app.AgentOutcome(failure_kind="model_request_error", status_code=401),
+            ),
+        ),
+        (
+            _failed(model_calls=3, transport=True),
+            app.RunEvidence(
+                has_result=False,
+                timed_out=False,
+                model_replied=True,
+                error=app.AgentOutcome(failure_kind="model_transport_error"),
+            ),
+        ),
+        # The runner failed itself or left no report: nothing says how the crew ended.
+        (_RUNNER_FAILED, app.RunEvidence(has_result=False, timed_out=False, model_replied=None)),
+    ],
+)
+def test_the_runner_report_reads_into_run_evidence(report, evidence):
+    assert _agent()._run_evidence(report, expired=False) == evidence
+
+
+def _activation(monkeypatch, report: dict[str, Any], *, expired: bool = False):
+    """An agent, a seeded session whose runner reports ``report``, and the activation's instruction."""
+    from responses_api_agents.crewai_agent.sandbox import CrewAISessionState
+
+    session = SimpleNamespace(
+        artifacts=report,
+        workdir="/app",
+        stop_request_path="/tmp/stop.request",
+        expired=expired,
+        expire_reason="budget" if expired else None,
+        execution_oom=None,
+        sandbox_stopped=False,
+        cleanup_confirmed=True,
+    )
+    state = CrewAISessionState(request=_seed(sandbox_access=_access()), session=session, grants=[])
+    state.activation_request = _body()
+    monkeypatch.setattr(CrewAIAgent, "resolve_model_base_url", lambda *args, **kwargs: "http://model:8000/v1")
+    monkeypatch.setattr(CrewAISessionState, "execute", AsyncMock(return_value=report))
+    agent = _agent()
+    return agent, state, agent._instruction(state, state.activation_request)
+
+
+@pytest.mark.parametrize(
+    ("report", "status", "stop_reason", "outcome"),
+    [
+        # a: an explicit context-limit rejection
+        (_CONTEXT_LIMIT, "incomplete", "context_limit", None),
+        # b, c: the run's deadline before any model reply, and after one
+        (_report(status="incomplete", stop_reason="wall_time"), "incomplete", "timeout", None),
+        (_report(status="incomplete", stop_reason="wall_time", model_calls=2), "incomplete", "timeout", None),
+        # d: no usable result (an HTTP 500 before the outcome ladder)
+        (_RUNNER_FAILED, "failed", "no_result", {"failure_kind": "agent_run_error"}),
+        # e: 429/5xx after the runner's retries, and a transport failure
+        (_failed(503, model_calls=1), "failed", "error", {"failure_kind": "model_request_error", "status_code": 503}),
+        (_failed(429), "failed", "error", {"failure_kind": "model_request_error", "status_code": 429}),
+        (_failed(transport=True), "failed", "error", {"failure_kind": "model_transport_error"}),
+        # f: another 4xx before any reply (a model_request_error before the ladder), and after one
+        (_failed(401), "failed", "error", {"failure_kind": "model_request_rejected"}),
+        (_failed(400, model_calls=1), "failed", "error", {"failure_kind": "model_request_error", "status_code": 400}),
+        # An unclassified CrewAI exception stays unknown.
+        (
+            _report(status="failed", error_type="RuntimeError", error_message="RuntimeError: boom", model_calls=1),
+            "failed",
+            "error",
+            {"failure_kind": "unknown"},
+        ),
+        (_report(model_calls=1, finish_reason="length"), "incomplete", "output_limit", None),
+        (_report(model_calls=1), "completed", "completed", None),
+    ],
+)
+async def test_each_run_ending_answers_200_with_the_ladders_status(monkeypatch, report, status, stop_reason, outcome):
+    agent, state, instruction = _activation(monkeypatch, report)
+
+    response = await agent._activate(state, instruction)
+
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == (status, stop_reason)
+    raw = response.metadata.get("ng_agent_outcome")
+    assert (json.loads(raw) if raw is not None else None) == outcome
+    assert (response.error is not None) == (status == "failed")
+    assert (response.incomplete_details is not None) == (stop_reason == "output_limit")
+    # The invocation the close bundle reports agrees with the response.
+    invocations = [record for record in agent._observations(state).records if record.kind == "agent_invocation"]
+    assert [invocation.status for invocation in invocations] == ([] if report is _RUNNER_FAILED else [status])
+
+
+@pytest.mark.parametrize("report", [_report(status="incomplete", stop_reason="wall_time"), _RUNNER_FAILED])
+async def test_a_rollout_stop_is_marked_even_when_the_runner_left_no_report(monkeypatch, report):
+    agent, state, instruction = _activation(monkeypatch, report, expired=True)
+
+    response = await agent._activate(state, instruction)
+
+    assert (response.status, response.metadata["ng_agent_stop_reason"]) == ("incomplete", "stopped")
+    assert json.loads(response.metadata[ROLLOUT_STOP_METADATA_KEY]) == {"reason": "budget"}
+    assert "ng_agent_outcome" not in response.metadata
+
+
+async def test_an_infrastructure_fault_is_a_typed_lifecycle_failure_that_close_replays(
+    lent_sandbox, runtime, monkeypatch
+):
+    from fastapi.testclient import TestClient
+
+    from nemo_gym.core import FailureHeader
+    from responses_api_agents.crewai_agent.sandbox import CrewAISessionState
+
+    _, access = lent_sandbox
+    infrastructure_error = {
+        "message": "required MCP grant weather did not list its tools",
+        "operation": "mcp_list_tools",
+        "grant_name": "weather",
+        "causes": [
+            {
+                "failure_kind": "transport_unreachable",
+                "exception_type": "httpx.ConnectError",
+                "message": "Connection to MCP server failed",
+                "http_status": None,
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        CrewAISessionState,
+        "execute",
+        AsyncMock(return_value=_report(status="failed", infrastructure_error=infrastructure_error)),
+    )
+    agent = _agent()
+
+    def exercise_routes():
+        application = agent.setup_webserver()
+        agent.setup_exception_middleware(application)
+        with TestClient(application) as client:
+            seed = client.post("/v1/agent_sessions", json=_seed(sandbox_access=access).model_dump(mode="json"))
+            assert seed.status_code == 200, seed.text
+            route = f"/ng-rollout/{_EPISODE.capture_key}/v1/responses"
+            failed = client.post(route, json=_body().model_dump(mode="json"))
+            closed = client.post("/v1/agent_sessions/close", json=_close_body().model_dump(mode="json"))
+            return failed, closed
+
+    response, close = await asyncio.to_thread(exercise_routes)
+
+    # Retried like the bare 503 it was before the outcome ladder, but typed, and never a graded 200.
+    assert response.status_code == 500
+    failure = FailureHeader.decode(response.headers)
+    route = failure.events[failure.failure_id]
+    assert (route.boundary, route.failure_kind, route.operation, route.stage) == (
+        "agent",
+        "agent_route_failed",
+        "crewai.activate",
+        "agent",
+    )
+    cause = failure.events[route.cause_id]
+    assert (cause.boundary, cause.failure_kind, cause.operation, cause.operation_id) == (
+        "harness",
+        "agent_run_error",
+        "mcp_list_tools",
+        "weather",
+    )
+    assert failure.events[cause.cause_id].failure_kind == "transport_unreachable"
+    replayed = FailureHeader.decode(close.headers)
+    assert close.status_code == 200 and replayed.failure_id is None
+    assert all(replayed.events[key] == event for key, event in failure.events.items())
+
+
+async def test_a_runner_that_left_no_report_reports_its_own_failure(lent_sandbox, runtime):
+    from responses_api_agents.crewai_agent.sandbox import CrewAISessionState
+
+    owner, access = lent_sandbox
+    session = SimpleNamespace(sandbox=owner, read_output_log=AsyncMock(return_value="Killed"))
+    state = CrewAISessionState(request=_seed(sandbox_access=access), session=session, grants=[])
+    path = f"{access.workdir}/output.json"
+
+    assert await state.collect_report(path) == {
+        "status": "failed",
+        "error": "exited without a report",
+        "traceback": "Killed",
+    }
+    # A report that is there but cannot be read is a lifecycle failure, not the crew's result.
+    Path(path).write_text("{")
+    with pytest.raises(RuntimeError, match="exited without a report"):
+        await state.collect_report(path)
+    Path(path).write_text('{"status": "completed"}')
+    assert await state.collect_report(path) == {"status": "completed"}
