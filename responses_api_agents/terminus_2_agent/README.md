@@ -56,20 +56,24 @@ or close, until the sandbox's owner stops the sandbox, as in Harbor: services th
 verification. A run still going at the time limit, on a rollout stop, or on close is stopped by the supervisor,
 and the runner saves the turns taken so far before it exits.
 
-The response status says how the run ended:
+The adapter reads the runner's result into a `RunEvidence`, and Gym's shared outcome ladder (`finish_response`) sets
+the response status, `ng_agent_outcome` and `ng_agent_stop_reason`; every ending answers HTTP 200:
 
 | Ending | Status | Metadata `stop_reason` |
 | --- | --- | --- |
-| Terminus confirmed completion | `completed` | `completed` |
-| `max_turns` reached, time limit, rollout stop, the terminal exited | `incomplete` | `max_turns`, `wall_time`, `wall_time`, `terminal_exited` |
+| Terminus confirmed completion, or the terminal exited | `completed` | `completed`, `terminal_exited` |
+| `max_turns` reached, time limit, rollout stop | `incomplete` | `max_turns`, `wall_time`, `wall_time` |
+| A reply cut off at the output limit | `incomplete`, with `incomplete_details` `max_output_tokens` | `error` |
 | Context overflow that summarization could not resolve | `incomplete` | `context_limit` |
 | Model request rejected or failed, other harness error | `failed`, with `ng_agent_outcome` | `error` |
+| The runner failed itself or saved no result | `failed`, with `ng_agent_outcome` `agent_run_error` | `error` |
 
 A rollout stop that arrives before the runner saved anything, during seed or while the runner starts, ends the run
-as an empty `wall_time` run. A failed response names `model_request_error` with the model's HTTP status,
-`model_transport_error`, `agent_invalid_output` (a reply cut off at the output limit), or `unknown`, and the
-Environment Server's outcome policy decides whether to verify, retry or fail the episode. Usage is reported only
-when every model response carried it.
+as an empty `wall_time` run. A failed response names `model_request_error` with the model's HTTP status
+(`model_request_rejected` for a 4xx other than 408, 425 and 429 before any model reply), `model_transport_error`,
+`agent_run_error`, or `unknown`, and the Environment Server's outcome policy decides whether to verify, retry or
+fail the episode. A result that is there but cannot be read answers HTTP 500. Usage is reported only when every
+model response carried it.
 
 ## Configuration
 

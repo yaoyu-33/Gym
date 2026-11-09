@@ -45,15 +45,16 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     assert_model_url_reachable_from_sandbox,
+    decide_outcome,
     resolve_agent_timeout,
 )
 from nemo_gym.client import get_response_json, raise_for_status
 from nemo_gym.config import ModelServerRef, ResourcesServerRef, get_global_config_dict
 from nemo_gym.core import (
-    AGENT_INVALID_OUTPUT,
     MODEL_REQUEST_ERROR,
     MODEL_TRANSPORT_ERROR,
     NeMoGymEasyInputMessage,
@@ -94,14 +95,8 @@ from responses_api_agents.terminus_2_agent.terminus import LocalEnvironment, Sta
 
 LOG = logging.getLogger(__name__)
 
-# How the sandbox runner's stop reasons end the response and the invocation; any other ending is a failure.
-_STATUS_BY_STOP_REASON: dict[str, Literal["completed", "incomplete"]] = {
-    "completed": "completed",
-    "max_turns": "incomplete",
-    "wall_time": "incomplete",
-    "cancelled": "incomplete",
-    "terminal_exited": "incomplete",
-}
+# The sandbox runner's stop reasons; a run that stopped for any other reason ended on an error it did not classify.
+_KNOWN_STOP_REASONS = frozenset({"completed", "terminal_exited", "max_turns", "wall_time", "cancelled", "error"})
 _SANDBOX_OUTCOME_BY_STOP_REASON = {"wall_time": "timeout", "cancelled": "cancelled"}
 
 
@@ -537,15 +532,16 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         )
 
     def classify_outcome(self, native_result: Mapping[str, Any]) -> AgentOutcome:
-        """Read the error kind the sandbox runner recorded for a run that ended early."""
+        """Read the error kind the sandbox runner recorded for a run that ended early.
+
+        A context overflow or an output-limit stop is ``RunEvidence`` of its own, never a classified failure.
+        """
         kind = native_result.get("error_kind")
         status = native_result.get("error_status")
         if kind == "model_request_error" and isinstance(status, int) and 400 <= status <= 599:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=status)
         if kind == "model_transport_error":
             return AgentOutcome(failure_kind=MODEL_TRANSPORT_ERROR)
-        if kind == "output_limit":
-            return AgentOutcome(failure_kind=AGENT_INVALID_OUTPUT)
         return AgentOutcome(failure_kind="unknown")
 
     @staticmethod
@@ -556,12 +552,31 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             else str(output.get("stop_reason") or "error")
         )
 
-    @staticmethod
-    def _status(output: Mapping[str, Any]) -> Literal["completed", "incomplete", "failed"]:
-        # A context overflow that summarization could not resolve is a limit of the run, graded like a timeout.
-        if output.get("error_kind") == "context_limit":
-            return "incomplete"
-        return _STATUS_BY_STOP_REASON.get(str(output.get("stop_reason")), "failed")
+    def _run_evidence(self, output: Mapping[str, Any]) -> RunEvidence:
+        """How the run ended, from the sandbox runner's result."""
+        if output.get("traceback") is not None:
+            # The runner itself failed, or left no result: Terminus left nothing usable.
+            return RunEvidence(has_result=False, timed_out=False, model_replied=None)
+        stop_reason, error_kind = output.get("stop_reason"), output.get("error_kind")
+        # A run that stopped on an error or for a reason this adapter does not know ended on that error; a context
+        # overflow summarization could not resolve and an output-limit stop are limits of the run instead.
+        ended_on_error = (stop_reason == "error" or stop_reason not in _KNOWN_STOP_REASONS) and error_kind not in (
+            "context_limit",
+            "output_limit",
+        )
+        return RunEvidence(
+            # Harbor ends Terminus's loop when the terminal session is gone; the run's work stays in the sandbox.
+            has_result=stop_reason in ("completed", "terminal_exited"),
+            # The runner records a SIGTERM without a stop request as the run's deadline (or a rollout stop).
+            timed_out=stop_reason == "wall_time",
+            # Every answered model call, in order.
+            model_replied=bool(output.get("response_ids")),
+            # Close stopped the run.
+            stopped=stop_reason == "cancelled",
+            context_limit=error_kind == "context_limit",
+            model_limit="output" if error_kind == "output_limit" else "turns" if stop_reason == "max_turns" else None,
+            error=self.classify_outcome(output) if ended_on_error else None,
+        )
 
     def _observations(
         self,
@@ -578,7 +593,8 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         invocation_id = state.invocation_id or "terminus2"
         try:
             stop_reason = self._stop_reason(output)
-            status = self._status(output)
+            # The response's status, from the same evidence.
+            status = decide_outcome(self._run_evidence(output)).status
             if conversation is None:
                 conversation = trajectory_to_responses(output.get("trajectory") or {"steps": []})
             # Terminus runs a turn's whole command batch, then records one terminal result for it. Every command of a
@@ -731,7 +747,6 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         duration_ms = (monotonic() - started) * 1000
 
         stop_reason = self._stop_reason(output)
-        status = self._status(output)
         context = AgentContext.model_validate(output.get("context") or {})
         response = self._response(
             body,
@@ -755,23 +770,26 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             conversation=[item.model_dump(mode="json", exclude_none=True) for item in response.output],
             duration_ms=duration_ms,
         )
-        error = output.get("error")
-        response = response.model_copy(
-            update={
-                "status": status,
-                "error": ResponseError(code="server_error", message=str(error)[:2000])
-                if status == "failed" and error
-                else None,
-                "metadata": {
-                    **(response.metadata or {}),
-                    "harness_execution": "sandbox",
-                    "stop_reason": stop_reason,
-                    AGENT_TIMEOUT_METADATA_KEY: str(timeout),
-                },
-            }
+        response = self.finish_response(
+            response.model_copy(
+                update={
+                    "metadata": {
+                        **(response.metadata or {}),
+                        "harness_execution": "sandbox",
+                        "stop_reason": stop_reason,
+                        AGENT_TIMEOUT_METADATA_KEY: str(timeout),
+                    }
+                }
+            ),
+            self._run_evidence(output),
+            session=state.session,
         )
-        response = self.report_outcome(response, output)
-        return self.report_rollout_stop(response, state.session)
+        error = output.get("error")
+        if response.status == "failed" and error:
+            response = response.model_copy(
+                update={"error": ResponseError(code="server_error", message=str(error)[:2000])}
+            )
+        return response
 
     async def responses(
         self,

@@ -239,11 +239,20 @@ class Terminus2SandboxSession(AgentSessionState):
         try:
             output = json.loads(await read_text(self.session.sandbox, path=path))
         except Exception as error:
-            if self.session.expired and await self._output_absent():
+            absent = await self._output_absent()
+            if self.session.expired and absent:
                 # A rollout stop ended the runner before it could save anything (it was still importing Harbor).
                 LOG.warning("Terminus 2 saved no result before a rollout stop ended it; reporting an empty run")
                 return _stopped_without_output()
             logs = await self.session.read_output_log()
+            if absent:
+                # The runner saves a result on every exit it can catch, so it was killed or never started: Terminus
+                # left no usable result, which the response reports as the runner's own failure.
+                return {
+                    "stop_reason": "error",
+                    "error": "Terminus 2 sandbox runner exited without output",
+                    "traceback": logs[-4000:],
+                }
             raise RuntimeError(f"Terminus 2 sandbox runner exited without output: {logs[-4000:]}") from error
         if not isinstance(output, dict):
             raise TypeError(f"Terminus 2 sandbox output at {path} is not an object")

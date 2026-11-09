@@ -17,9 +17,11 @@ from starlette.requests import Request
 
 from nemo_gym.agents import (
     AgentCloseSessionRequest,
+    AgentOutcome,
     AgentSeedSessionRequest,
     AgentSessionSetupError,
     RolloutStopRequest,
+    RunEvidence,
     SandboxPythonRuntime,
     SandboxSession,
     check_agent_seed_rejected,
@@ -526,18 +528,15 @@ class TestActivation:
                 {"failure_kind": "unknown"},
                 "failed",
             ),
-            (
-                {"stop_reason": "error", "error_kind": "output_limit"},
-                "failed",
-                {"failure_kind": "agent_invalid_output"},
-                "failed",
-            ),
+            # The outcome ladder's output limit (a graded failed agent_invalid_output before it).
+            ({"stop_reason": "error", "error_kind": "output_limit"}, "incomplete", None, "completed"),
             ({"stop_reason": "error", "error_kind": "harness_error"}, "failed", {"failure_kind": "unknown"}, "failed"),
             ({"stop_reason": "error", "error_kind": "context_limit"}, "incomplete", None, "completed"),
             ({"stop_reason": "wall_time", "finished_naturally": False}, "incomplete", None, "timeout"),
             ({"stop_reason": "max_turns", "finished_naturally": False}, "incomplete", None, "completed"),
             ({"stop_reason": "cancelled", "finished_naturally": False}, "incomplete", None, "cancelled"),
-            ({"stop_reason": "terminal_exited", "finished_naturally": False}, "incomplete", None, "completed"),
+            # The runner exited cleanly and the work is in the sandbox (a graded incomplete response before the ladder).
+            ({"stop_reason": "terminal_exited", "finished_naturally": False}, "completed", None, "completed"),
             # A stop reason this adapter does not know is a failure, never a graded ending.
             ({"stop_reason": "something_new"}, "failed", {"failure_kind": "unknown"}, "failed"),
         ],
@@ -578,6 +577,59 @@ class TestActivation:
 
         [tool] = [record for record in closed.agent_observations.records if isinstance(record, ToolCallObservation)]
         assert tool.status == "failed"
+
+    @pytest.mark.parametrize(
+        ("result", "evidence"),
+        [
+            ({}, {"has_result": True}),
+            ({"stop_reason": "terminal_exited", "finished_naturally": False}, {"has_result": True}),
+            ({"stop_reason": "max_turns"}, {"model_limit": "turns"}),
+            ({"stop_reason": "wall_time", "response_ids": []}, {"timed_out": True, "model_replied": False}),
+            ({"stop_reason": "cancelled"}, {"stopped": True}),
+            ({"stop_reason": "error", "error_kind": "context_limit"}, {"context_limit": True}),
+            ({"stop_reason": "error", "error_kind": "output_limit"}, {"model_limit": "output"}),
+            (
+                {"stop_reason": "error", "error_kind": "model_request_error", "error_status": 401, "response_ids": []},
+                {"model_replied": False, "error": AgentOutcome(failure_kind="model_request_error", status_code=401)},
+            ),
+            ({"stop_reason": "something_new"}, {"error": AgentOutcome(failure_kind="unknown")}),
+            # The runner failed itself or saved no result: nothing says how Terminus ended.
+            (
+                {"stop_reason": "error", "error_kind": "harness_error", "traceback": "Traceback"},
+                {"model_replied": None},
+            ),
+        ],
+    )
+    def test_the_runners_result_reads_into_run_evidence(self, result: dict, evidence: dict) -> None:
+        expected = RunEvidence(**{"has_result": False, "timed_out": False, "model_replied": True, **evidence})
+
+        assert _agent()._run_evidence(_output(**result)) == expected
+
+    @pytest.mark.parametrize(
+        ("result", "outcome"),
+        [
+            # A 4xx other than 408/425/429 before any model reply (model_request_error 401 before the ladder).
+            (
+                {"error_kind": "model_request_error", "error_status": 401, "response_ids": []},
+                {"failure_kind": "model_request_rejected"},
+            ),
+            # The runner failed itself: no usable result (failed unknown before the ladder; both retried).
+            ({"error_kind": "harness_error", "traceback": "Traceback"}, {"failure_kind": "agent_run_error"}),
+        ],
+    )
+    async def test_a_failed_run_answers_200_with_the_ladders_outcome(
+        self, monkeypatch: pytest.MonkeyPatch, result: dict, outcome: dict
+    ) -> None:
+        activation = _Activation(monkeypatch, _output(stop_reason="error", error="Boom", **result))
+
+        response = await activation.respond()
+
+        assert (response.status, response.metadata["ng_agent_stop_reason"]) == (
+            "failed",
+            "error" if "error_status" in result else "no_result",
+        )
+        assert json.loads(response.metadata["ng_agent_outcome"]) == outcome
+        assert response.error.message == "Boom"
 
     async def test_the_request_instructions_join_the_instruction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         activation = _Activation(monkeypatch, system_prompt="You are Terminus.")
@@ -1052,7 +1104,9 @@ class TestSandboxLifecycle:
         assert (response.status, response.metadata["stop_reason"], response.error) == ("incomplete", "wall_time", None)
         assert json.loads(response.metadata["ng_rollout_stop"]) == {"reason": "budget"}
 
-    async def test_a_runner_that_saved_nothing_without_a_stop_is_still_an_error(self, wired: SimpleNamespace) -> None:
+    async def test_a_runner_that_saved_nothing_without_a_stop_is_no_usable_result(
+        self, wired: SimpleNamespace
+    ) -> None:
         wired.sandbox = FakeSandbox(runner="dies_early")
         agent, seed, request = await self._seeded(wired)
         running = asyncio.create_task(agent.responses(request, _BODY))
@@ -1060,9 +1114,13 @@ class TestSandboxLifecycle:
 
         # The runner ends on its own, without a rollout stop, and leaves no result.
         wired.sandbox.ended.set()
+        response = await asyncio.wait_for(running, 30)
 
-        with pytest.raises(RuntimeError, match="exited without output"):
-            await asyncio.wait_for(running, 30)
+        # The outcome ladder: HTTP 200, failed agent_run_error, retried by default (an HTTP 500 before the ladder).
+        assert response.status == "failed"
+        assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "agent_run_error"}
+        assert "exited without output" in response.error.message
+        assert "ng_rollout_stop" not in response.metadata
 
     async def test_a_rollout_stop_while_running_keeps_the_saved_turns(self, wired: SimpleNamespace) -> None:
         wired.sandbox = FakeSandbox(runner="blocks")
@@ -1089,7 +1147,10 @@ class TestSandboxLifecycle:
         # Close stopped the runner and captured its saved turns before it cancelled the activation.
         response = await asyncio.wait_for(running, 30)
         assert (response.status, response.metadata["stop_reason"]) == ("incomplete", "cancelled")
-        assert "ng_rollout_stop" not in response.metadata
+        # The outcome ladder's stopped row. Its finish_response marks every stopped run with ng_rollout_stop, a
+        # close included, so this no longer pins that marker's absence.
+        assert response.metadata["ng_agent_stop_reason"] == "stopped"
+        assert "ng_agent_outcome" not in response.metadata
         assert "observation_capture_failed" not in {gap.code for gap in closed.agent_observations.gaps}
         [invocation] = [record for record in closed.agent_observations.records if isinstance(record, AgentInvocation)]
         assert (invocation.status, invocation.stop_reason) == ("incomplete", "cancelled")
@@ -1170,8 +1231,21 @@ class TestStageAndCollect:
         state = _Activation(monkeypatch).state
         state.session.read_output_log = AsyncMock(return_value="ModuleNotFoundError: harbor")
 
+        # A result that is there but cannot be read stays a lifecycle failure.
         with pytest.raises(RuntimeError, match="exited without output: ModuleNotFoundError: harbor"):
             await state.collect_artifacts()
+
+    async def test_a_runner_that_left_no_output_reports_its_own_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(terminus_sandbox, "read_text", AsyncMock(side_effect=FileNotFoundError("output.json")))
+        state = _Activation(monkeypatch).state
+        state.session.sandbox = _sandbox(_ok("absent\n"))
+        state.session.read_output_log = AsyncMock(return_value="Killed")
+
+        assert await state.collect_artifacts() == {
+            "stop_reason": "error",
+            "error": "Terminus 2 sandbox runner exited without output",
+            "traceback": "Killed",
+        }
 
 
 class TestRuntime:
