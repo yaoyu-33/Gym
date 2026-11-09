@@ -17,9 +17,11 @@ from fastapi import HTTPException
 
 from nemo_gym.agents import (
     HARNESS_RUNNER_SCRIPT,
+    AgentOutcome,
     AgentSeedSessionRequest,
     AgentSessionSetupError,
     OutcomeAction,
+    RunEvidence,
     SandboxSession,
     agent_outcome_policy,
     check_agent_seed_rejected,
@@ -34,7 +36,7 @@ from nemo_gym.core import (
     RequestFailureLog,
 )
 from nemo_gym.sandbox import AsyncSandbox
-from responses_api_agents.droid_agent import app, runtime
+from responses_api_agents.droid_agent import app, parsing, runtime
 from responses_api_agents.droid_agent import sandbox as adapter
 
 
@@ -281,7 +283,11 @@ async def test_activation_routes_droid_through_the_rollout_model_route(monkeypat
     )
     assert NeMoGymResponseUsage.sum_from_list([response.usage, known]).output_tokens_details.reasoning_tokens is None
     assert "reasoning_token_usage_unavailable" in {gap.code for gap in session.observations.gaps}
-    assert response.metadata == {"harness_execution": "sandbox", "agent_timeout_sec": "1800.0"}
+    assert response.metadata == {
+        "harness_execution": "sandbox",
+        "agent_timeout_sec": "1800.0",
+        "ng_agent_stop_reason": "completed",
+    }
     assert response.error is None
 
     invocation, tool, sandbox_record = session.observations.records
@@ -295,15 +301,17 @@ async def test_activation_routes_droid_through_the_rollout_model_route(monkeypat
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "events,cleanup,status,reason",
+    "events,cleanup,status,reason,stop_reason",
     [
-        (EVENTS[:-1], {"timed_out": True, "return_code": 143}, "incomplete", "timeout"),
-        # A cut or lost stream leaves nothing to grade, so it fails instead of being verified as the model's zero.
-        (EVENTS[:-1], {"timed_out": False, "return_code": 0}, "failed", "result_missing"),
-        (EVENTS, {"timed_out": False, "return_code": 2}, "failed", "process_exit_2"),
+        (EVENTS[:-1], {"timed_out": True, "return_code": 143}, "incomplete", "timeout", "timeout"),
+        # A deadline before any model reply is graded too, as it was before the outcome ladder.
+        (EVENTS[:2], {"timed_out": True, "return_code": 143}, "incomplete", "timeout", "timeout"),
+        # A cut or lost stream, or a nonzero exit, leaves no usable result: failed agent_run_error, retried.
+        (EVENTS[:-1], {"timed_out": False, "return_code": 0}, "failed", "result_missing", "no_result"),
+        (EVENTS, {"timed_out": False, "return_code": 2}, "failed", "process_exit_2", "no_result"),
     ],
 )
-async def test_outcome_follows_droid_exit_and_completion(monkeypatch, events, cleanup, status, reason):
+async def test_outcome_follows_droid_exit_and_completion(monkeypatch, events, cleanup, status, reason, stop_reason):
     instance = agent(monkeypatch, timeout=1200)
     session = state(cleanup=cleanup | {"cleanup_confirmed": True})
     monkeypatch.setattr(
@@ -311,16 +319,21 @@ async def test_outcome_follows_droid_exit_and_completion(monkeypatch, events, cl
     )
     response = await instance._sandbox_response(session, body(metadata={"agent_timeout_sec": "300"}))
     assert response.status == status
+    assert response.metadata["ng_agent_stop_reason"] == stop_reason
     invocation = session.observations.records[0]
     assert invocation.error_type == reason
     # The deadline that applied, and whether it ended the run, tell an expired deadline from a missing result.
     assert response.metadata["agent_timeout_sec"] == "300.0"
     assert invocation.stop_reason == ("timeout" if reason == "timeout" else None)
     if status == "failed":
-        assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "unknown"}
+        # Before the outcome ladder this was `unknown`; both are retried by default.
+        assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "agent_run_error"}
+        assert agent_outcome_policy(response) == OutcomeAction.RETRY
         # Without an error event, the environment's failure reason names what ended the run.
         assert (response.error.code, response.error.message) == ("server_error", reason)
     else:
+        assert "ng_agent_outcome" not in response.metadata
+        assert agent_outcome_policy(response) == OutcomeAction.VERIFY
         assert response.error is None
     if events is not EVENTS:
         # Without the completion event Droid reports no usage, so none is invented.
@@ -330,20 +343,25 @@ async def test_outcome_follows_droid_exit_and_completion(monkeypatch, events, cl
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("detail", ['{"status":404,"title":"Not Found"}', "x" * 5000])
-async def test_model_request_error_is_classified_for_the_environment(monkeypatch, detail):
+@pytest.mark.parametrize("replied", [False, True])
+async def test_model_request_error_is_classified_for_the_environment(monkeypatch, detail, replied):
     instance = agent(monkeypatch)
     session = state(cleanup={"timed_out": False, "return_code": 1, "cleanup_confirmed": True})
     error = f"404 {detail}"
-    events = [EVENTS[0], {"type": "error", "source": "agent_loop", "message": error}]
+    events = [*(EVENTS[:5] if replied else EVENTS[:1]), {"type": "error", "source": "agent_loop", "message": error}]
     monkeypatch.setattr(
         adapter.DroidSandboxSession, "execute", AsyncMock(return_value=adapter.DroidArtifacts(stdout(events)))
     )
     response = await instance._sandbox_response(session, body())
     assert response.status == "failed"
-    assert json.loads(response.metadata["ng_agent_outcome"]) == {
-        "failure_kind": "model_request_error",
-        "status_code": 404,
-    }
+    # A 404 before any model reply means the run's setup was refused (model_request_rejected); after a reply it is
+    # the model request's own error. Neither is graded or retried.
+    assert json.loads(response.metadata["ng_agent_outcome"]) == (
+        {"failure_kind": "model_request_error", "status_code": 404}
+        if replied
+        else {"failure_kind": "model_request_rejected"}
+    )
+    assert agent_outcome_policy(response) == OutcomeAction.FAIL
     # The environment saves Droid's message as the failure reason, cut to the length it keeps.
     message = response.error.message
     if len(error) <= 2000:
@@ -380,6 +398,37 @@ CONTEXT_LIMIT_ERROR = (
 def test_classifier_reads_droid_error_messages(monkeypatch, message, kind):
     outcome = agent(monkeypatch).classify_outcome({"error": message})
     assert (outcome.failure_kind, outcome.status_code) == kind
+
+
+@pytest.mark.parametrize(
+    "events,timed_out,return_code,evidence",
+    [
+        (EVENTS, False, 0, {"has_result": True, "model_replied": True}),
+        # A completion with a nonzero exit, or no completion, is not a result.
+        (EVENTS, False, 2, {"model_replied": True}),
+        (EVENTS[:-1], False, 0, {"model_replied": True}),
+        # The init and the prompt are not model replies.
+        (EVENTS[:2], True, None, {"timed_out": True}),
+        (
+            [*EVENTS[:2], {"type": "error", "source": "agent_loop", "message": "401 unauthorized"}],
+            False,
+            1,
+            {"error": AgentOutcome(failure_kind="model_request_error", status_code=401)},
+        ),
+        (
+            [*EVENTS[:4], {"type": "error", "source": "agent_loop", "message": CONTEXT_LIMIT_ERROR}],
+            False,
+            1,
+            {"model_replied": True, "error": AgentOutcome(failure_kind="model_context_limit")},
+        ),
+    ],
+)
+def test_run_evidence_reads_droid_events_and_exit(monkeypatch, events, timed_out, return_code, evidence):
+    run = parsing.parse_events(stdout(events), invocation_id="rollout")
+    expected = {"has_result": False, "timed_out": False, "model_replied": False, **evidence}
+    assert agent(monkeypatch)._run_evidence(run, timed_out=timed_out, return_code=return_code) == RunEvidence(
+        **expected
+    )
 
 
 @pytest.mark.asyncio
@@ -429,7 +478,8 @@ async def test_error_lookalikes_outside_terminal_events_do_not_classify_the_run(
             "process_exit_1",
             "process_exit_1",
         )
-        assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "unknown"}
+        # A nonzero exit without an error event is no usable result (``unknown`` before the outcome ladder).
+        assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "agent_run_error"}
         assert agent_outcome_policy(response) == OutcomeAction.RETRY
     else:
         assert (response.status, response.error, invocation.error_type) == ("completed", None, None)
@@ -453,7 +503,9 @@ async def test_context_limit_keeps_partial_work_verifiable(monkeypatch):
     response = await instance._sandbox_response(session, body())
     assert (response.status, response.error) == ("incomplete", None)
     assert response.output
-    assert json.loads(response.metadata["ng_agent_outcome"]) == {"failure_kind": "model_context_limit"}
+    # An incomplete response carries no failure kind; the stop reason names the context limit instead.
+    assert "ng_agent_outcome" not in response.metadata
+    assert response.metadata["ng_agent_stop_reason"] == "context_limit"
     assert agent_outcome_policy(response) == OutcomeAction.VERIFY
     invocation = session.observations.records[0]
     assert (invocation.status, invocation.stop_reason, invocation.error_type) == (

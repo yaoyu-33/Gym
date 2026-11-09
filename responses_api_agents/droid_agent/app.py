@@ -26,10 +26,10 @@ from typing import Any, ClassVar, Optional
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field
 
 from nemo_gym.agents import (
-    AGENT_OUTCOME_METADATA_KEY,
     AGENT_TIMEOUT_METADATA_KEY,
     HARNESS_RUNNER_FILE,
     HARNESS_RUNNER_SCRIPT,
@@ -41,6 +41,7 @@ from nemo_gym.agents import (
     AgentSessionState,
     BaseResponsesAPIAgentConfig,
     Body,
+    RunEvidence,
     SandboxSession,
     SimpleResponsesAPIAgent,
     assert_model_url_reachable_from_sandbox,
@@ -162,6 +163,20 @@ class DroidAgent(SimpleResponsesAPIAgent):
         if match:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=int(match[1]))
         return AgentOutcome(failure_kind="unknown")
+
+    def _run_evidence(self, run: DroidRun, *, timed_out: bool, return_code: int | None) -> RunEvidence:
+        """What a ``droid exec`` run's events and exit show about how it ended, for the outcome ladder.
+
+        Droid's terminal ``error`` event is the error the run ended on (``classify_outcome``; a context overflow
+        among them). The ``completion`` event with a clean exit is the result. Any assistant message, reasoning or
+        tool call in the output counts as a model reply.
+        """
+        return RunEvidence(
+            has_result=run.completed and return_code in (0, None),
+            timed_out=timed_out,
+            model_replied=bool(run.items),
+            error=self.classify_outcome({"error": run.error}) if run.error is not None else None,
+        )
 
     def _rollout_sandbox_session(self, state: AgentSessionState) -> SandboxSession | None:
         return state.session if isinstance(state, DroidSandboxSession) else None
@@ -424,28 +439,54 @@ class DroidAgent(SimpleResponsesAPIAgent):
         run = await asyncio.to_thread(parse_events, artifacts.events if artifacts else "", invocation_id=invocation_id)
         cleanup = state.session.cleanup
         return_code = cleanup["return_code"] if cleanup else None
-        if cleanup and cleanup["timed_out"]:
-            status, reason = "incomplete", "timeout"
+        timed_out = bool(cleanup and cleanup["timed_out"])
+        evidence = self._run_evidence(run, timed_out=timed_out, return_code=return_code)
+        # What ended the run, for the observations; the outcome ladder decides the response's status.
+        if timed_out:
+            reason = "timeout"
         elif isinstance(failure, asyncio.CancelledError):
-            status, reason = "incomplete", "cancelled"
+            reason = "cancelled"
         elif failure is not None:
-            status, reason = "failed", "sandbox_error"
-        elif run.error is not None and self.classify_outcome({"error": run.error}).failure_kind == MODEL_CONTEXT_LIMIT:
-            # The conversation outgrew the model's context: the partial work is verified, not retried.
-            status, reason = "incomplete", "context_limit"
-        elif run.error is not None:
-            status, reason = "failed", "agent_error"
+            reason = "sandbox_error"
+        elif evidence.error is not None:
+            reason = "context_limit" if evidence.error.failure_kind == MODEL_CONTEXT_LIMIT else "agent_error"
         elif return_code not in (0, None):
-            status, reason = "failed", f"process_exit_{return_code}"
+            reason = f"process_exit_{return_code}"
         elif run.completed:
-            status, reason = "completed", None
+            reason = None
         else:
             # Exit 0 without a completion event: the stream was cut or lost, so there is no result to grade.
-            status, reason = "failed", "result_missing"
+            reason = "result_missing"
 
         conversation = [NeMoGymEasyInputMessage(role="system", content=system)] if system else []
         conversation.append(NeMoGymEasyInputMessage(role="user", content=prompt))
         usage = self._usage(run)
+        response: NeMoGymResponse | None = None
+        if failure is not None:
+            status = "incomplete" if isinstance(failure, asyncio.CancelledError) or timed_out else "failed"
+        else:
+            response = self.finish_response(
+                NeMoGymResponse(
+                    id=f"resp_{uuid4().hex}",
+                    created_at=int(time()),
+                    model=self.config.model,
+                    object="response",
+                    output=run.items,
+                    tool_choice=body.tool_choice,
+                    tools=body.tools,
+                    parallel_tool_calls=body.parallel_tool_calls,
+                    usage=usage,
+                    metadata={"harness_execution": "sandbox", AGENT_TIMEOUT_METADATA_KEY: str(timeout)},
+                ),
+                evidence,
+                session=state.session,
+            )
+            if response.status == "failed":
+                # Droid's own error message, or what ended the run without one. Droid holds no credential (its key
+                # is a placeholder), so the message is bounded, not redacted.
+                message = bounded_text(run.error or reason, _FAILURE_REASON_CHARS)
+                response = response.model_copy(update={"error": ResponseError(code="server_error", message=message)})
+            status = response.status
         gaps = list(run.gaps)
         if artifacts is None:
             gaps.append(ObservationGap(code="agent_artifact_unavailable", invocation_id=invocation_id))
@@ -505,30 +546,7 @@ class DroidAgent(SimpleResponsesAPIAgent):
         state.observations = AgentObservationBundle(source="droid", records=records, gaps=gaps)
         if failure is not None:
             raise failure
-        response = NeMoGymResponse(
-            id=f"resp_{uuid4().hex}",
-            created_at=int(time()),
-            model=self.config.model,
-            object="response",
-            output=run.items,
-            status=status,
-            # Droid's own error message, or what ended the run without one. Droid holds no credential (its key is a
-            # placeholder), so the message is bounded, not redacted.
-            error={"code": "server_error", "message": bounded_text(run.error or reason, _FAILURE_REASON_CHARS)}
-            if status == "failed"
-            else None,
-            tool_choice=body.tool_choice,
-            tools=body.tools,
-            parallel_tool_calls=body.parallel_tool_calls,
-            usage=usage,
-            metadata={"harness_execution": "sandbox", AGENT_TIMEOUT_METADATA_KEY: str(timeout)},
-        )
-        response = self.report_rollout_stop(response, state.session)
-        if reason == "context_limit":
-            # report_outcome describes failed responses only; the stop still tells the environment its cause.
-            outcome = AgentOutcome(failure_kind=MODEL_CONTEXT_LIMIT).model_dump_json(exclude_none=True)
-            return response.model_copy(update={"metadata": {**response.metadata, AGENT_OUTCOME_METADATA_KEY: outcome}})
-        return self.report_outcome(response, {"error": run.error})
+        return response
 
     async def responses(
         self, request: Request, body: NeMoGymResponseCreateParamsNonStreaming = Body()

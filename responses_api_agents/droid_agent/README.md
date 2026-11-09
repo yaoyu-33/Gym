@@ -139,14 +139,18 @@ reasoning as reasoning items, and every tool call and result, in order. A tool r
 text is serialized as JSON. Subagent reports that Droid injects as user messages stay in the
 invocation's conversation, not in the response output, and a gap records that.
 
+The adapter reads the run's events and exit into evidence, and the shared outcome ladder decides the
+response (see [Add or update a harness](../../fern/versions/latest/pages/agent-server/add-or-update-a-harness.mdx));
+`ng_agent_stop_reason` names the deciding row. Every finished run answers HTTP 200.
+
 | Run ends with | Response status |
 | --- | --- |
 | a `completion` event and exit 0 | `completed` |
-| the time limit | `incomplete`; the invocation's `stop_reason` is `timeout` |
+| the time limit, before or after a model reply | `incomplete`; the invocation's `stop_reason` is `timeout` |
 | a rollout stop | `incomplete`, with `ng_rollout_stop` |
-| a context overflow that compaction cannot fit | `incomplete`, with `ng_agent_outcome` `model_context_limit`; `stop_reason` `context_limit` |
-| exit 0 without a `completion` event | `failed`, with `ng_agent_outcome` `unknown`: a cut or lost stream is not graded |
-| an `error` event, or a nonzero exit | `failed`, with `ng_agent_outcome` |
+| a context overflow that compaction cannot fit | `incomplete`; `stop_reason` `context_limit` |
+| an `error` event | `failed`, with `ng_agent_outcome` from the classifier below; a 4xx other than 408, 425 and 429 before any model reply is `model_request_rejected` |
+| exit 0 without a `completion` event, or a nonzero exit without an `error` event | `failed`, with `ng_agent_outcome` `agent_run_error`: no usable result, retried by default |
 
 Every response's metadata carries the deadline that applied, in seconds, as `agent_timeout_sec`.
 A failed response's `error.message` is Droid's error message, or what ended the run without one
@@ -161,7 +165,7 @@ assistant text and stderr are not model-failure evidence, even when their text m
 | --- | --- |
 | the HTTP status, a space, then the error body's message (`429 rate limited`) | `model_request_error` with that status |
 | exactly `Connection error.` (a refused or reset connection) | `model_transport_error` |
-| exactly Droid's compaction-does-not-fit message (after a `context_length_exceeded` rejection) | `model_context_limit` |
+| exactly Droid's compaction-does-not-fit message (after a `context_length_exceeded` rejection) | `model_context_limit` (the response is `incomplete`) |
 | anything else | `unknown` |
 
 Another `droid_version` may word these differently, so its failures are reported as `unknown`. The
